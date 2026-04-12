@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     convert::TryFrom,
     fmt, io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
@@ -23,17 +24,47 @@ impl std::fmt::Display for Network {
     }
 }
 
-pub type StreamId = u64;
-
 #[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
+pub enum StreamId {
+    U64(u64),
+    Uuid(uuid::Uuid),
+}
+
+impl std::fmt::Display for StreamId {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::U64(id) => write!(f, "{}", id),
+            Self::Uuid(id) => write!(f, "{}", id),
+        }
+    }
+}
+
+#[derive(PartialEq, Eq, Hash, Clone, Debug)]
 pub struct DatagramSource {
     pub address: SocketAddr,
     pub stream_id: Option<StreamId>,
+    pub process_name: Option<String>,
 }
 
 impl DatagramSource {
     pub fn new(address: SocketAddr, stream_id: Option<StreamId>) -> Self {
-        DatagramSource { address, stream_id }
+        DatagramSource {
+            address,
+            stream_id,
+            process_name: None,
+        }
+    }
+
+    pub fn new_with_process_name(
+        address: SocketAddr,
+        stream_id: Option<StreamId>,
+        process_name: Option<String>,
+    ) -> Self {
+        DatagramSource {
+            address,
+            stream_id,
+            process_name,
+        }
     }
 }
 
@@ -47,7 +78,9 @@ impl std::fmt::Display for DatagramSource {
     }
 }
 
+#[derive(Debug)]
 pub struct Session {
+    pub span: tracing::Span,
     /// The network type, representing either TCP or UDP.
     pub network: Network,
     /// The socket address of the remote peer of an inbound connection.
@@ -64,14 +97,27 @@ pub struct Session {
     pub stream_id: Option<StreamId>,
     /// Optional source address which is forwarded via HTTP reverse proxy.
     pub forwarded_source: Option<IpAddr>,
+    /// Optional process name that initiated this connection.
+    pub process_name: Option<String>,
     /// Instructs a multiplexed transport should creates a new underlying
     /// connection for this session, and it will be used only once.
     pub new_conn_once: bool,
+    /// The sniffed domain name from TLS SNI.
+    pub tls_sniffed_domain: Option<String>,
+    /// The sniffed domain name from HTTP Host.
+    pub http_sniffed_domain: Option<String>,
+    /// The sniffed domain name if the destination is an IP address.
+    pub dns_sniffed_domain: Option<String>,
+    /// Shared state to coordinate XTLS vision read raw mode.
+    pub vision_read_raw: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Skip domain resolution during routing.
+    pub skip_resolve: bool,
 }
 
 impl Clone for Session {
     fn clone(&self) -> Self {
         Session {
+            span: self.span.clone(),
             network: self.network,
             source: self.source,
             local_addr: self.local_addr,
@@ -80,7 +126,13 @@ impl Clone for Session {
             outbound_tag: self.outbound_tag.clone(),
             stream_id: self.stream_id,
             forwarded_source: self.forwarded_source,
+            process_name: self.process_name.clone(),
             new_conn_once: self.new_conn_once,
+            tls_sniffed_domain: self.tls_sniffed_domain.clone(),
+            http_sniffed_domain: self.http_sniffed_domain.clone(),
+            dns_sniffed_domain: self.dns_sniffed_domain.clone(),
+            vision_read_raw: self.vision_read_raw.clone(),
+            skip_resolve: self.skip_resolve,
         }
     }
 }
@@ -88,6 +140,7 @@ impl Clone for Session {
 impl Default for Session {
     fn default() -> Self {
         Session {
+            span: Self::create_span(),
             network: Network::Tcp,
             source: *crate::option::UNSPECIFIED_BIND_ADDR,
             local_addr: *crate::option::UNSPECIFIED_BIND_ADDR,
@@ -96,7 +149,71 @@ impl Default for Session {
             outbound_tag: "".to_string(),
             stream_id: None,
             forwarded_source: None,
+            process_name: None,
             new_conn_once: false,
+            tls_sniffed_domain: None,
+            http_sniffed_domain: None,
+            dns_sniffed_domain: None,
+            vision_read_raw: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            skip_resolve: false,
+        }
+    }
+}
+
+impl Session {
+    pub fn create_span() -> tracing::Span {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let trace_id: String = (0..8)
+            .map(|_| {
+                const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+                let idx = rng.gen_range(0..CHARS.len());
+                CHARS[idx] as char
+            })
+            .collect();
+        let span = tracing::debug_span!("sess", tid = trace_id);
+        let _g = span.enter();
+        tracing::debug!("created span");
+        span.clone()
+    }
+
+    pub fn new_span(&mut self) {
+        self.span = Self::create_span();
+    }
+
+    pub fn span(&self) -> tracing::Span {
+        self.span.clone()
+    }
+
+    pub fn destination_for_routing(&self) -> io::Result<Cow<'_, SocksAddr>> {
+        let mut target_domain = None;
+        if crate::option::TLS_DOMAIN_SNIFFING.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Some(domain) = &self.tls_sniffed_domain {
+                target_domain = Some(domain);
+            }
+        }
+        if target_domain.is_none()
+            && crate::option::HTTP_DOMAIN_SNIFFING.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            if let Some(domain) = &self.http_sniffed_domain {
+                target_domain = Some(domain);
+            }
+        }
+        if target_domain.is_none()
+            && crate::option::DNS_DOMAIN_SNIFFING.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            if let Some(domain) = &self.dns_sniffed_domain {
+                target_domain = Some(domain);
+            }
+        }
+
+        if let Some(domain) = target_domain {
+            Ok(Cow::Owned(SocksAddr::try_from((
+                domain.as_str(),
+                self.destination.port(),
+            ))?))
+        } else {
+            Ok(Cow::Borrowed(&self.destination))
         }
     }
 }
@@ -129,15 +246,15 @@ pub enum SocksAddr {
 }
 
 fn insuff_bytes() -> io::Error {
-    io::Error::new(io::ErrorKind::Other, "insufficient bytes")
+    io::Error::other("insufficient bytes")
 }
 
 fn invalid_domain() -> io::Error {
-    io::Error::new(io::ErrorKind::Other, "invalid domain")
+    io::Error::other("invalid domain")
 }
 
 fn invalid_addr_type() -> io::Error {
-    io::Error::new(io::ErrorKind::Other, "invalid address type")
+    io::Error::other("invalid address type")
 }
 
 impl SocksAddr {
@@ -396,7 +513,7 @@ impl TryFrom<(String, u16)> for SocksAddr {
             return Ok(Self::from((ip, port)));
         }
         if addr.len() > 0xff {
-            return Err(io::Error::new(io::ErrorKind::Other, "domain too long"));
+            return Err(io::Error::other("domain too long"));
         }
         Ok(Self::Domain(addr, port))
     }
@@ -445,16 +562,14 @@ impl TryFrom<(&[u8], SocksAddrWireType)> for SocksAddr {
                     if buf.len() < 1 + domain_len + 2 {
                         return Err(insuff_bytes());
                     }
-                    let domain =
-                        String::from_utf8(buf[2..domain_len + 2].to_vec()).map_err(|e| {
-                            io::Error::new(io::ErrorKind::Other, format!("invalid domain: {}", e))
-                        })?;
+                    let domain = String::from_utf8(buf[2..domain_len + 2].to_vec())
+                        .map_err(|e| io::Error::other(format!("invalid domain: {}", e)))?;
                     let mut port_bytes = [0u8; 2];
                     port_bytes.copy_from_slice(&buf[domain_len + 2..domain_len + 4]);
                     let port = u16::from_be_bytes(port_bytes);
                     Ok(Self::Domain(domain, port))
                 }
-                _ => Err(io::Error::new(io::ErrorKind::Other, "invalid address type")),
+                _ => Err(io::Error::other("invalid address type")),
             },
             SocksAddrWireType::PortFirst => match buf[0] {
                 SocksAddrPortFirstType::V4 => {
@@ -493,12 +608,11 @@ impl TryFrom<(&[u8], SocksAddrWireType)> for SocksAddr {
                     if buf.len() < domain_len {
                         return Err(insuff_bytes());
                     }
-                    let domain = String::from_utf8(buf[..domain_len].to_vec()).map_err(|e| {
-                        io::Error::new(io::ErrorKind::Other, format!("invalid domain: {}", e))
-                    })?;
+                    let domain = String::from_utf8(buf[..domain_len].to_vec())
+                        .map_err(|e| io::Error::other(format!("invalid domain: {}", e)))?;
                     Ok(Self::Domain(domain, port))
                 }
-                _ => Err(io::Error::new(io::ErrorKind::Other, "invalid address type")),
+                _ => Err(io::Error::other("invalid address type")),
             },
         }
     }

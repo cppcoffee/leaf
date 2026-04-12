@@ -21,10 +21,11 @@ impl OutboundDatagramHandler for Handler {
         _sess: &'a Session,
         transport: Option<AnyOutboundTransport>,
     ) -> io::Result<AnyOutboundDatagram> {
+        tracing::trace!("handling outbound datagram");
         if let Some(OutboundTransport::Datagram(dgram)) = transport {
             Ok(dgram)
         } else {
-            Err(io::Error::new(io::ErrorKind::Other, "invalid input"))
+            Err(io::Error::other("invalid input"))
         }
     }
 }

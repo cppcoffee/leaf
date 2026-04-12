@@ -3,15 +3,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::{sync::Arc, time::Duration};
 
 use bytes::BytesMut;
+use hickory_proto::{
+    op::{header::MessageType, op_code::OpCode, query::Query, Message},
+    rr::{record_type::RecordType, Name},
+};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, Notify};
 use tokio::time::{timeout, Instant};
 use tracing::{debug, trace, warn};
-use trust_dns_proto::{
-    op::{header::MessageType, op_code::OpCode, query::Query, Message},
-    rr::{record_type::RecordType, Name},
-};
 
 use crate::{app::SyncDnsClient, proxy::*, session::*};
 
@@ -62,10 +62,11 @@ async fn single_health_check(
 
     match network {
         Network::Tcp => {
-            let stream = match crate::proxy::connect_stream_outbound(&sess, dns_client, &h).await {
-                Ok(s) => s,
-                Err(_) => return Measure::new(idx, u128::MAX, tag),
-            };
+            let stream =
+                match crate::proxy::connect_stream_outbound(&sess, dns_client.clone(), &h).await {
+                    Ok(s) => s,
+                    Err(_) => return Measure::new(idx, u128::MAX, tag),
+                };
             let m: Measure;
 
             let Ok(h) = h.stream() else {
@@ -79,7 +80,12 @@ async fn single_health_check(
                         String::from(""),
                         vec![],
                         None,
+                        None,
                         false,
+                        false,
+                        false,
+                        None,
+                        dns_client.clone(),
                     ) else {
                         return Measure::new(idx, u128::MAX, tag);
                     };

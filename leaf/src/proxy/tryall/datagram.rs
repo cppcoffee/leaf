@@ -32,6 +32,7 @@ impl OutboundDatagramHandler for Handler {
         sess: &'a Session,
         _transport: Option<AnyOutboundTransport>,
     ) -> io::Result<AnyOutboundDatagram> {
+        tracing::trace!("handling outbound datagram");
         let mut tasks = Vec::new();
         for (i, a) in self.actors.iter().enumerate() {
             let t = async move {
@@ -61,10 +62,10 @@ impl OutboundDatagramHandler for Handler {
                 );
                 Ok(v.0.dgram)
             }
-            Err(e) => Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("all outbound attempts failed, last error: {}", e),
-            )),
+            Err(e) => Err(io::Error::other(format!(
+                "all outbound attempts failed, last error: {}",
+                e
+            ))),
         }
     }
 }

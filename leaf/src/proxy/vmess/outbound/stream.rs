@@ -30,9 +30,9 @@ impl OutboundStreamHandler for Handler {
         _lhs: Option<&mut AnyStream>,
         stream: Option<AnyStream>,
     ) -> io::Result<AnyStream> {
-        let uuid = Uuid::parse_str(&self.uuid).map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("parse uuid failed: {}", e))
-        })?;
+        tracing::trace!("handling outbound stream");
+        let uuid = Uuid::parse_str(&self.uuid)
+            .map_err(|e| io::Error::other(format!("parse uuid failed: {}", e)))?;
         let mut request_header = RequestHeader {
             version: 0x1,
             command: REQUEST_COMMAND_TCP,
@@ -52,23 +52,18 @@ impl OutboundStreamHandler for Handler {
                 request_header.security = SECURITY_TYPE_AES128_GCM;
             }
             _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("unsupported cipher: {}", &self.security),
-                ))
+                return Err(io::Error::other(format!(
+                    "unsupported cipher: {}",
+                    &self.security
+                )))
             }
         }
 
         let mut header_buf = BytesMut::new();
-        let client_sess = ClientSession::new();
+        let client_sess = ClientSession::new(true);
         request_header
             .encode(&mut header_buf, &client_sess)
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("encode request header failed: {}", e),
-                )
-            })?;
+            .map_err(|e| io::Error::other(format!("encode request header failed: {}", e)))?;
 
         let enc_size_parser = ShakeSizeParser::new(&client_sess.request_body_iv);
 
@@ -77,9 +72,7 @@ impl OutboundStreamHandler for Handler {
             &client_sess.request_body_key,
             &client_sess.request_body_iv,
         )
-        .map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("new encryptor failed: {}", e))
-        })?;
+        .map_err(|e| io::Error::other(format!("new encryptor failed: {}", e)))?;
 
         let dec_size_parser = ShakeSizeParser::new(&client_sess.response_body_iv);
         let dec = new_decryptor(
@@ -87,12 +80,9 @@ impl OutboundStreamHandler for Handler {
             &client_sess.response_body_key,
             &client_sess.response_body_iv,
         )
-        .map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("new decryptor failed: {}", e))
-        })?;
+        .map_err(|e| io::Error::other(format!("new decryptor failed: {}", e)))?;
 
-        let mut stream =
-            stream.ok_or_else(|| io::Error::new(io::ErrorKind::Other, "invalid input"))?;
+        let mut stream = stream.ok_or_else(|| io::Error::other("invalid input"))?;
 
         stream.write_all(&header_buf).await?; // write request
         let stream = VMessAuthStream::new(

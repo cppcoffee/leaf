@@ -117,6 +117,7 @@ impl OutboundDatagramHandler for Handler {
         sess: &'a Session,
         _transport: Option<AnyOutboundTransport>,
     ) -> io::Result<AnyOutboundDatagram> {
+        tracing::trace!("handling outbound datagram");
         *self.last_active.lock().await = Instant::now();
 
         if let Some(task) = self.health_check_task.lock().await.take() {
@@ -153,7 +154,7 @@ impl OutboundDatagramHandler for Handler {
 
         for i in schedule {
             if i >= self.actors.len() {
-                return Err(io::Error::new(io::ErrorKind::Other, "invalid actor index"));
+                return Err(io::Error::other("invalid actor index"));
             }
 
             let a = &self.actors[i];
@@ -219,9 +220,6 @@ impl OutboundDatagramHandler for Handler {
                 .await;
         }
 
-        Err(io::Error::new(
-            io::ErrorKind::Other,
-            "all outbound attempts failed",
-        ))
+        Err(io::Error::other("all outbound attempts failed"))
     }
 }

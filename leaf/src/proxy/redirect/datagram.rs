@@ -26,15 +26,16 @@ impl OutboundDatagramHandler for Handler {
         sess: &'a Session,
         transport: Option<AnyOutboundTransport>,
     ) -> io::Result<AnyOutboundDatagram> {
+        tracing::trace!("handling outbound datagram");
         let dgram = if let Some(OutboundTransport::Datagram(dgram)) = transport {
             dgram
         } else {
-            return Err(io::Error::new(io::ErrorKind::Other, "invalid input"));
+            return Err(io::Error::other("invalid input"));
         };
         let target = SocksAddr::from((
-            self.address.parse::<IpAddr>().map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("parse IpAddr failed: {}", e))
-            })?,
+            self.address
+                .parse::<IpAddr>()
+                .map_err(|e| io::Error::other(format!("parse IpAddr failed: {}", e)))?,
             self.port,
         ));
         Ok(Box::new(Datagram {

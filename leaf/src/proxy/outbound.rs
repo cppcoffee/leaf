@@ -7,38 +7,44 @@ use super::*;
 /// handler.
 pub struct Handler {
     tag: String,
-    color: colored::Color,
     stream_handler: Option<AnyOutboundStreamHandler>,
     datagram_handler: Option<AnyOutboundDatagramHandler>,
+    is_direct: bool,
 }
 
 impl Handler {
     pub(self) fn new(
         tag: String,
-        color: colored::Color,
         stream_handler: Option<AnyOutboundStreamHandler>,
         datagram_handler: Option<AnyOutboundDatagramHandler>,
+        is_direct: bool,
     ) -> Arc<Self> {
         Arc::new(Handler {
             tag,
-            color,
             stream_handler,
             datagram_handler,
+            is_direct,
         })
     }
 }
+
+impl BaseHandler for Handler {}
 
 impl OutboundHandler for Handler {
     fn stream(&self) -> io::Result<&AnyOutboundStreamHandler> {
         self.stream_handler
             .as_ref()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no tcp handler"))
+            .ok_or_else(|| io::Error::other("no tcp handler"))
     }
 
     fn datagram(&self) -> io::Result<&AnyOutboundDatagramHandler> {
         self.datagram_handler
             .as_ref()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no udp handler"))
+            .ok_or_else(|| io::Error::other("no udp handler"))
+    }
+
+    fn is_direct(&self) -> bool {
+        self.is_direct
     }
 }
 
@@ -48,36 +54,25 @@ impl Tag for Handler {
     }
 }
 
-impl Color for Handler {
-    fn color(&self) -> &colored::Color {
-        &self.color
-    }
-}
-
 pub struct HandlerBuilder {
     tag: String,
-    color: colored::Color,
     stream_handler: Option<AnyOutboundStreamHandler>,
     datagram_handler: Option<AnyOutboundDatagramHandler>,
+    is_direct: bool,
 }
 
 impl HandlerBuilder {
     pub fn new() -> Self {
         Self {
             tag: "".to_string(),
-            color: colored::Color::Magenta,
             stream_handler: None,
             datagram_handler: None,
+            is_direct: false,
         }
     }
 
     pub fn tag(mut self, v: String) -> Self {
         self.tag = v;
-        self
-    }
-
-    pub fn color(mut self, v: colored::Color) -> Self {
-        self.color = v;
         self
     }
 
@@ -91,12 +86,17 @@ impl HandlerBuilder {
         self
     }
 
+    pub fn is_direct(mut self, v: bool) -> Self {
+        self.is_direct = v;
+        self
+    }
+
     pub fn build(self) -> AnyOutboundHandler {
         Handler::new(
             self.tag,
-            self.color,
             self.stream_handler,
             self.datagram_handler,
+            self.is_direct,
         )
     }
 }

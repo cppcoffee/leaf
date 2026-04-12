@@ -21,6 +21,7 @@ impl OutboundDatagramHandler for Handler {
         _sess: &'a Session,
         _transport: Option<AnyOutboundTransport>,
     ) -> io::Result<AnyOutboundDatagram> {
-        Err(io::Error::new(io::ErrorKind::Other, "dropped"))
+        tracing::trace!("handling outbound datagram");
+        Err(io::Error::other("dropped"))
     }
 }

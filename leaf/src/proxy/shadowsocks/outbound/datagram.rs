@@ -29,6 +29,7 @@ impl OutboundDatagramHandler for Handler {
         sess: &'a Session,
         transport: Option<AnyOutboundTransport>,
     ) -> io::Result<AnyOutboundDatagram> {
+        tracing::trace!("handling outbound datagram");
         let server_addr = SocksAddr::try_from((&self.address, self.port))?;
 
         let socket = if let Some(OutboundTransport::Datagram(socket)) = transport {
@@ -36,15 +37,13 @@ impl OutboundDatagramHandler for Handler {
         } else {
             // Don't accept stream transport because we can't determine datagram
             // boundary.
-            return Err(io::Error::new(io::ErrorKind::Other, "invalid ss input"));
+            return Err(io::Error::other("invalid ss input"));
         };
 
         let dgram = ShadowedDatagram::new(&self.cipher, &self.password)?;
 
         let destination = match &sess.destination {
-            SocksAddr::Domain(domain, port) => {
-                Some(SocksAddr::Domain(domain.to_owned(), port.to_owned()))
-            }
+            SocksAddr::Domain(domain, port) => Some(SocksAddr::Domain(domain.to_owned(), *port)),
             _ => None,
         };
 

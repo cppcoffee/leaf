@@ -182,15 +182,17 @@ pub struct ExternalOutboundStreamHandlerProxy(pub AnyExternalOutboundStreamHandl
 
 #[async_trait]
 impl OutboundStreamHandler for ExternalOutboundStreamHandlerProxy {
-    fn connect_addr(&self) -> Option<OutboundConnect> {
-        self.0.connect_addr()
+    fn connect_addr(&self) -> OutboundConnect {
+        self.0.connect_addr().unwrap_or(OutboundConnect::Unknown)
     }
 
     async fn handle<'a>(
         &'a self,
         sess: &'a Session,
+        _lhs: Option<&mut AnyStream>,
         stream: Option<AnyStream>,
     ) -> io::Result<AnyStream> {
+        tracing::trace!("handling outbound stream");
         self.0.handle(sess, stream).await
     }
 }
@@ -199,8 +201,8 @@ pub struct ExternalOutboundDatagramHandlerProxy(pub AnyExternalOutboundDatagramH
 
 #[async_trait]
 impl OutboundDatagramHandler for ExternalOutboundDatagramHandlerProxy {
-    fn connect_addr(&self) -> Option<OutboundConnect> {
-        self.0.connect_addr()
+    fn connect_addr(&self) -> OutboundConnect {
+        self.0.connect_addr().unwrap_or(OutboundConnect::Unknown)
     }
 
     fn transport_type(&self) -> DatagramTransportType {
@@ -212,6 +214,7 @@ impl OutboundDatagramHandler for ExternalOutboundDatagramHandlerProxy {
         sess: &'a Session,
         transport: Option<AnyOutboundTransport>,
     ) -> io::Result<AnyOutboundDatagram> {
+        tracing::trace!("handling outbound datagram");
         self.0.handle(sess, transport).await
     }
 }

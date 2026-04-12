@@ -1,5 +1,5 @@
 use std::{
-    io::{Error, ErrorKind, Result},
+    io::{Error, Result},
     sync::Arc,
 };
 
@@ -8,11 +8,13 @@ use async_trait::async_trait;
 use futures::future::TryFutureExt;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::{app::SyncDnsClient, proxy::*, session::*};
+use crate::{app::SyncDnsClient, common::resolver::Resolver, proxy::*, session::*};
 
 pub struct Handler {
     pub address: String,
     pub port: u16,
+    pub username: String,
+    pub password: String,
     pub dns_client: SyncDnsClient,
 }
 
@@ -34,29 +36,38 @@ impl OutboundDatagramHandler for Handler {
         sess: &'a Session,
         _transport: Option<AnyOutboundTransport>,
     ) -> io::Result<AnyOutboundDatagram> {
+        tracing::trace!("handling outbound datagram");
         // TODO support chaining, this requires implementing our own socks5 client
         let stream = self
             .new_tcp_stream(self.dns_client.clone(), &self.address, &self.port)
             .await?;
-        let mut indicator = sess.source.clone();
+        let mut indicator = sess.source;
         if let Ok(ip) = self.address.parse::<IpAddr>() {
             if ip.is_loopback() {
                 indicator = SocketAddr::new(ip, 0);
             }
         }
         let socket = self.new_udp_socket(&indicator).await?;
-        let socket = SocksDatagram::associate(
-            stream,
-            socket,
-            None::<Auth>,
-            SocksAddr::try_from((self.address.clone(), self.port))
-                .unwrap()
-                .must_ip()
-                .clone()
-                .into(),
-        )
-        .map_err(|x| Error::new(ErrorKind::Other, x))
-        .await?;
+
+        // Resolve the SOCKS server address to IP (handles both IP and domain names)
+        let mut resolver = Resolver::new(self.dns_client.clone(), &self.address, &self.port)
+            .await
+            .map_err(|e| Error::other(format!("resolve SOCKS server address failed: {}", e)))?;
+        let server_addr = resolver
+            .next()
+            .ok_or_else(|| Error::other("no resolved address for SOCKS server"))?;
+
+        let auth = match (&self.username, &self.password) {
+            (auth_username, _) if auth_username.is_empty() => None,
+            (auth_username, auth_password) => Some(Auth {
+                username: auth_username.to_owned(),
+                password: auth_password.to_owned(),
+            }),
+        };
+
+        let socket = SocksDatagram::associate(stream, socket, auth, server_addr.into())
+            .map_err(Error::other)
+            .await?;
         Ok(Box::new(Datagram { socket }))
     }
 }
@@ -92,11 +103,7 @@ where
     S: 'static + AsyncRead + AsyncWrite + Send + Unpin + Sync,
 {
     async fn recv_from(&mut self, buf: &mut [u8]) -> Result<(usize, SocksAddr)> {
-        let (n, addr) = self
-            .0
-            .recv_from(buf)
-            .map_err(|x| Error::new(ErrorKind::Other, x))
-            .await?;
+        let (n, addr) = self.0.recv_from(buf).map_err(Error::other).await?;
         match addr {
             AddrKind::Ip(addr) => Ok((n, SocksAddr::Ip(addr))),
             AddrKind::Domain(domain, port) => Ok((n, SocksAddr::Domain(domain, port))),
@@ -117,14 +124,14 @@ where
                 self.0
                     .send_to(buf, a.to_owned())
                     .map_ok(|_| buf.len())
-                    .map_err(|x| Error::new(ErrorKind::Other, x))
+                    .map_err(Error::other)
                     .await
             }
             SocksAddr::Domain(domain, port) => {
                 self.0
                     .send_to(buf, (domain.to_owned(), *port))
                     .map_ok(|_| buf.len())
-                    .map_err(|x| Error::new(ErrorKind::Other, x))
+                    .map_err(Error::other)
                     .await
             }
         }

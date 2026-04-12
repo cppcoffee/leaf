@@ -16,6 +16,7 @@ impl InboundDatagramHandler for Handler {
         &'a self,
         mut socket: AnyInboundDatagram,
     ) -> io::Result<AnyInboundTransport> {
+        tracing::trace!("handling inbound datagram");
         let mut sess: Option<Session> = None;
         for (i, a) in self.actors.iter().enumerate() {
             let transport = a.datagram()?.handle(socket).await?;
@@ -34,7 +35,7 @@ impl InboundDatagramHandler for Handler {
                     ))));
                 }
                 _ => {
-                    return Err(io::Error::new(io::ErrorKind::Other, "invalid transport"));
+                    return Err(io::Error::other("invalid transport"));
                 }
             }
         }

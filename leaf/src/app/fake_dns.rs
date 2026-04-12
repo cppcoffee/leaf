@@ -2,14 +2,14 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 
 use anyhow::{anyhow, Result};
-use tokio::sync::RwLock;
-use tracing::debug;
-use trust_dns_proto::op::{
+use hickory_proto::op::{
     header::MessageType, op_code::OpCode, response_code::ResponseCode, Message,
 };
-use trust_dns_proto::rr::{
+use hickory_proto::rr::{
     dns_class::DNSClass, rdata, record_data::RData, record_type::RecordType, resource::Record,
 };
+use tokio::sync::RwLock;
+use tracing::debug;
 
 pub enum FakeDnsMode {
     Include,
@@ -19,12 +19,8 @@ pub enum FakeDnsMode {
 pub struct FakeDns(RwLock<FakeDnsImpl>);
 
 impl FakeDns {
-    pub fn new(mode: FakeDnsMode) -> Self {
-        Self(RwLock::new(FakeDnsImpl::new(mode)))
-    }
-
-    pub async fn add_filter(&self, filter: String) {
-        self.0.write().await.add_filter(filter)
+    pub fn new(mode: FakeDnsMode, filters: Vec<String>) -> Self {
+        Self(RwLock::new(FakeDnsImpl::new(mode, filters)))
     }
 
     pub async fn query_domain(&self, ip: &IpAddr) -> Option<String> {
@@ -56,7 +52,7 @@ struct FakeDnsImpl {
 }
 
 impl FakeDnsImpl {
-    pub(self) fn new(mode: FakeDnsMode) -> Self {
+    pub(self) fn new(mode: FakeDnsMode, filters: Vec<String>) -> Self {
         let min_cursor = Self::ip_to_u32(&Ipv4Addr::new(198, 18, 0, 0));
         let max_cursor = Self::ip_to_u32(&Ipv4Addr::new(198, 18, 255, 255));
         Self {
@@ -66,13 +62,9 @@ impl FakeDnsImpl {
             min_cursor,
             max_cursor,
             ttl: 1,
-            filters: Vec::new(),
+            filters,
             mode,
         }
-    }
-
-    pub(self) fn add_filter(&mut self, filter: String) {
-        self.filters.push(filter);
     }
 
     pub(self) fn query_domain(&self, ip: &IpAddr) -> Option<String> {

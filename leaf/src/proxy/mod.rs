@@ -1,3 +1,4 @@
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::ffi::CString;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -10,19 +11,22 @@ use futures::stream::Stream;
 use futures::TryFutureExt;
 use socket2::{Domain, SockRef, Socket, Type};
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 use tokio::time::timeout;
-use tracing::debug;
+use tracing::{debug, trace};
 
 #[cfg(unix)]
-use std::os::unix::io::{AsFd, AsRawFd};
+use std::os::unix::io::AsFd;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::os::unix::io::AsRawFd;
 #[cfg(windows)]
-use std::os::windows::io::{AsRawSocket, AsSocket};
+use std::os::windows::io::AsSocket;
 #[cfg(target_os = "android")]
 use {
-    std::os::unix::io::RawFd, tokio::io::AsyncReadExt, tokio::io::AsyncWriteExt,
-    tokio::net::UnixStream, tracing::trace,
+    std::os::unix::io::{AsRawFd, RawFd},
+    tokio::io::AsyncWriteExt,
+    tokio::net::UnixStream,
 };
 
 use crate::{
@@ -46,12 +50,20 @@ pub mod direct;
 pub mod drop;
 #[cfg(feature = "outbound-failover")]
 pub mod failover;
+#[cfg(feature = "inbound-hc")]
+pub mod hc;
 #[cfg(feature = "inbound-http")]
 pub mod http;
+#[cfg(feature = "outbound-mptp")]
+pub mod mptp;
+#[cfg(all(feature = "inbound-nf", windows))]
+pub mod nf;
 #[cfg(feature = "outbound-obfs")]
 pub mod obfs;
 #[cfg(any(feature = "inbound-quic", feature = "outbound-quic"))]
 pub mod quic;
+#[cfg(feature = "outbound-reality")]
+pub mod reality;
 #[cfg(feature = "outbound-redirect")]
 pub mod redirect;
 #[cfg(feature = "outbound-select")]
@@ -70,6 +82,8 @@ pub mod trojan;
 pub mod tryall;
 #[cfg(feature = "inbound-tun")]
 pub mod tun;
+#[cfg(feature = "outbound-vless")]
+pub mod vless;
 #[cfg(feature = "outbound-vmess")]
 pub mod vmess;
 #[cfg(any(feature = "inbound-ws", feature = "outbound-ws"))]
@@ -96,10 +110,6 @@ pub enum DatagramTransportType {
 
 pub trait Tag {
     fn tag(&self) -> &String;
-}
-
-pub trait Color {
-    fn color(&self) -> &colored::Color;
 }
 
 #[derive(Debug)]
@@ -183,10 +193,14 @@ impl TcpListener {
         })
     }
 
+    pub fn io(&self) -> &tokio::net::TcpListener {
+        &self.inner
+    }
+
     pub async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
         let (stream, addr) = self.inner.accept().await?;
         apply_socket_opts(&stream)?;
-        stream.set_linger(Some(Duration::ZERO))?;
+        SockRef::from(&stream).set_linger(Some(Duration::ZERO))?;
         Ok((stream, addr))
     }
 }
@@ -204,6 +218,9 @@ async fn bind_socket<T: BindSocket>(socket: &T, indicator: &SocketAddr) -> io::R
             return Ok(());
         }
         _ => {}
+    }
+    if option::OUTBOUND_BINDS.is_empty() {
+        return Ok(());
     }
     let mut last_err = None;
     for bind in option::OUTBOUND_BINDS.iter() {
@@ -260,6 +277,7 @@ async fn bind_socket<T: BindSocket>(socket: &T, indicator: &SocketAddr) -> io::R
                 }
                 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
                 {
+                    let _ = iface;
                     return Err(io::Error::new(
                         io::ErrorKind::Other,
                         "binding to interface is not supported on this platform",
@@ -299,6 +317,10 @@ pub async fn new_udp_socket(indicator: &SocketAddr) -> io::Result<UdpSocket> {
 
     bind_socket(&socket, indicator).await?;
 
+    if option::OUTBOUND_BINDS.is_empty() && indicator.ip().is_unspecified() {
+        BindSocket::bind(&socket, indicator)?;
+    }
+
     #[cfg(target_os = "android")]
     protect_socket(socket.as_raw_fd()).await?;
 
@@ -306,7 +328,8 @@ pub async fn new_udp_socket(indicator: &SocketAddr) -> io::Result<UdpSocket> {
 }
 
 fn apply_socket_opts_internal(s: SockRef) -> io::Result<()> {
-    s.set_keepalive(true)
+    s.set_keepalive(true)?;
+    s.set_nodelay(true)
 }
 
 #[cfg(unix)]
@@ -375,17 +398,20 @@ pub async fn connect_stream_outbound(
 ) -> io::Result<Option<AnyStream>> {
     match handler.stream()?.connect_addr() {
         OutboundConnect::Proxy(Network::Tcp, addr, port) => {
+            trace!("connect stream proxy outbound addr={} port={}", &addr, port);
             Ok(Some(new_tcp_stream(dns_client, &addr, &port).await?))
         }
-        OutboundConnect::Direct => Ok(Some(
-            new_tcp_stream(
-                dns_client,
-                &sess.destination.host(),
-                &sess.destination.port(),
-            )
-            .await?,
-        )),
-        _ => Ok(None),
+        OutboundConnect::Direct => {
+            let dest = &sess.destination;
+            trace!("connect stream direct dst={}", &dest);
+            Ok(Some(
+                new_tcp_stream(dns_client, &dest.host(), &dest.port()).await?,
+            ))
+        }
+        _ => {
+            trace!("connect stream None");
+            Ok(None)
+        }
     }
 }
 
@@ -417,7 +443,7 @@ pub async fn connect_datagram_outbound(
                     DomainAssociatedOutboundDatagram::new(
                         socket,
                         sess.source,
-                        SocksAddr::Domain(domain.to_owned(), port.to_owned()),
+                        SocksAddr::Domain(domain.to_owned(), *port),
                         dns_client.clone(),
                     ),
                 ))))
@@ -445,12 +471,7 @@ pub async fn new_tcp_stream(
     port: &u16,
 ) -> io::Result<AnyStream> {
     let mut resolver = Resolver::new(dns_client.clone(), address, port)
-        .map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("resolve address failed: {}", e),
-            )
-        })
+        .map_err(|e| io::Error::other(format!("resolve address failed: {}", e)))
         .await?;
 
     let mut last_err = None;
@@ -481,10 +502,10 @@ pub async fn new_tcp_stream(
                     return Ok(v.0.stream);
                 }
                 Err(e) => {
-                    last_err = Some(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("all attempts failed, last error: {}", e),
-                    ));
+                    last_err = Some(io::Error::other(format!(
+                        "all attempts failed, last error: {}",
+                        e
+                    )));
                 }
             }
         }
@@ -528,10 +549,15 @@ impl<S> ProxyStream for S where S: AsyncRead + AsyncWrite + Send + Sync + Unpin 
 
 pub type AnyStream = Box<dyn ProxyStream>;
 
+pub trait BaseHandler: Tag + Send + Sync + Unpin {}
+
 /// An outbound handler for both UDP and TCP outgoing connections.
-pub trait OutboundHandler: Tag + Color + Sync + Send + Unpin {
+pub trait OutboundHandler: BaseHandler {
     fn stream(&self) -> io::Result<&AnyOutboundStreamHandler>;
     fn datagram(&self) -> io::Result<&AnyOutboundDatagramHandler>;
+    fn is_direct(&self) -> bool {
+        false
+    }
 }
 
 pub type AnyOutboundHandler = Arc<dyn OutboundHandler>;
@@ -546,7 +572,7 @@ pub enum OutboundConnect {
 
 /// An outbound handler for outgoing TCP conections.
 #[async_trait]
-pub trait OutboundStreamHandler<S = AnyStream>: Send + Sync + Unpin {
+pub trait OutboundStreamHandler: Send + Sync + Unpin {
     /// Returns the address which the underlying transport should
     /// communicate with.
     fn connect_addr(&self) -> OutboundConnect;
@@ -556,12 +582,12 @@ pub trait OutboundStreamHandler<S = AnyStream>: Send + Sync + Unpin {
     async fn handle<'a>(
         &'a self,
         sess: &'a Session,
-        lhs: Option<&mut S>,
-        stream: Option<S>,
-    ) -> io::Result<S>;
+        lhs: Option<&mut AnyStream>,
+        stream: Option<AnyStream>,
+    ) -> io::Result<AnyStream>;
 }
 
-type AnyOutboundStreamHandler = Box<dyn OutboundStreamHandler>;
+pub type AnyOutboundStreamHandler = Arc<dyn OutboundStreamHandler>;
 
 /// An unreliable transport for outbound handlers.
 pub trait OutboundDatagram: Send + Unpin {
@@ -597,9 +623,7 @@ pub trait OutboundDatagramSendHalf: Sync + Send + Unpin {
 
 /// An outbound handler for outgoing UDP connections.
 #[async_trait]
-pub trait OutboundDatagramHandler<S = AnyStream, D = AnyOutboundDatagram>:
-    Send + Sync + Unpin
-{
+pub trait OutboundDatagramHandler: Send + Sync + Unpin {
     /// Returns the address which the underlying transport should
     /// communicate with.
     fn connect_addr(&self) -> OutboundConnect;
@@ -612,11 +636,11 @@ pub trait OutboundDatagramHandler<S = AnyStream, D = AnyOutboundDatagram>:
     async fn handle<'a>(
         &'a self,
         sess: &'a Session,
-        transport: Option<OutboundTransport<S, D>>,
-    ) -> io::Result<D>;
+        transport: Option<AnyOutboundTransport>,
+    ) -> io::Result<AnyOutboundDatagram>;
 }
 
-type AnyOutboundDatagramHandler = Box<dyn OutboundDatagramHandler>;
+pub type AnyOutboundDatagramHandler = Arc<dyn OutboundDatagramHandler>;
 
 /// An outbound transport represents either a reliable or unreliable transport.
 pub enum OutboundTransport<S, D> {
@@ -628,7 +652,7 @@ pub enum OutboundTransport<S, D> {
 
 pub type AnyOutboundTransport = OutboundTransport<AnyStream, AnyOutboundDatagram>;
 
-pub trait InboundHandler: Tag + Send + Sync + Unpin {
+pub trait InboundHandler: BaseHandler {
     fn stream(&self) -> io::Result<&AnyInboundStreamHandler>;
     fn datagram(&self) -> io::Result<&AnyInboundDatagramHandler>;
 }
@@ -637,22 +661,20 @@ pub type AnyInboundHandler = Arc<dyn InboundHandler>;
 
 /// An inbound handler for incoming TCP connections.
 #[async_trait]
-pub trait InboundStreamHandler<S = AnyStream, D = AnyInboundDatagram>: Send + Sync + Unpin {
+pub trait InboundStreamHandler: Send + Sync + Unpin {
     async fn handle<'a>(
         &'a self,
         sess: Session,
-        stream: S,
-    ) -> std::io::Result<InboundTransport<S, D>>;
+        stream: AnyStream,
+    ) -> std::io::Result<AnyInboundTransport>;
 }
 
 pub type AnyInboundStreamHandler = Arc<dyn InboundStreamHandler>;
 
 /// An inbound handler for incoming UDP connections.
 #[async_trait]
-pub trait InboundDatagramHandler<S = AnyStream, D = AnyInboundDatagram>:
-    Send + Sync + Unpin
-{
-    async fn handle<'a>(&'a self, socket: D) -> io::Result<InboundTransport<S, D>>;
+pub trait InboundDatagramHandler: Send + Sync + Unpin {
+    async fn handle<'a>(&'a self, socket: AnyInboundDatagram) -> io::Result<AnyInboundTransport>;
 }
 
 pub type AnyInboundDatagramHandler = Arc<dyn InboundDatagramHandler>;
@@ -731,3 +753,15 @@ pub enum InboundTransport<S, D> {
 }
 
 pub type AnyInboundTransport = InboundTransport<AnyStream, AnyInboundDatagram>;
+
+/// Peeks data from the local side of a stream.
+pub async fn peek_tcp_one_off(lhs: Option<&mut AnyStream>) -> Vec<u8> {
+    if let Some(lhs) = lhs {
+        let mut read_buf = Vec::with_capacity(2 * 1024);
+        match timeout(Duration::from_millis(10), lhs.read_buf(&mut read_buf)).await {
+            Ok(Ok(_)) => return read_buf,
+            _ => return Vec::new(),
+        }
+    }
+    Vec::new()
+}

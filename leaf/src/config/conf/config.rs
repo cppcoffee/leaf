@@ -5,10 +5,9 @@ use std::io::{self, BufRead};
 use std::path::Path;
 
 use anyhow::Result;
-use protobuf::Message;
 use regex::Regex;
 
-use crate::config::{external_rule, internal};
+use crate::config::{common, internal};
 
 #[derive(Debug, Default)]
 pub struct Tun {
@@ -20,12 +19,21 @@ pub struct Tun {
 }
 
 #[derive(Debug, Default)]
+pub struct Nf {
+    pub driver_name: String,
+    pub nfapi: Option<String>,
+}
+
+#[derive(Debug, Default)]
 pub struct General {
     pub tun: Option<Tun>,
     pub tun_fd: Option<i32>,
     pub tun_auto: Option<bool>,
+    pub tun2socks_backend: Option<String>,
+    pub nf: Option<Nf>,
     pub loglevel: Option<String>,
     pub logoutput: Option<String>,
+    pub logformat: Option<String>,
     pub dns_server: Option<Vec<String>>,
     pub dns_interface: Option<String>,
     pub always_real_ip: Option<Vec<String>>,
@@ -37,6 +45,8 @@ pub struct General {
     pub api_interface: Option<String>,
     pub api_port: Option<u16>,
     pub routing_domain_resolve: Option<bool>,
+    pub wintun: Option<String>,
+    pub tun_dns_server: Option<Vec<String>>,
 }
 
 #[derive(Debug)]
@@ -65,6 +75,9 @@ pub struct Proxy {
     pub tls: Option<bool>,
     pub tls_cert: Option<String>,
     pub tls_insecure: Option<bool>,
+    pub tls_ech: Option<bool>,
+    pub tls_ech_disable_dns_lookup: Option<bool>,
+    pub tls_ech_config_list: Option<String>,
     pub ws_path: Option<String>,
     pub ws_host: Option<String>,
 
@@ -73,6 +86,7 @@ pub struct Proxy {
 
     // vmess
     pub username: Option<String>,
+    pub uuid: Option<String>,
 
     pub amux: Option<bool>,
     pub amux_max: Option<i32>,
@@ -81,6 +95,11 @@ pub struct Proxy {
     pub amux_max_lifetime: Option<u64>,
 
     pub quic: Option<bool>,
+
+    // reality
+    pub reality: Option<bool>,
+    pub reality_public_key: Option<String>,
+    pub reality_short_id: Option<String>,
 }
 
 impl Default for Proxy {
@@ -101,16 +120,23 @@ impl Default for Proxy {
             tls: Some(false),
             tls_cert: None,
             tls_insecure: Some(false),
+            tls_ech: Some(false),
+            tls_ech_disable_dns_lookup: Some(false),
+            tls_ech_config_list: None,
             ws_path: None,
             ws_host: None,
             sni: None,
             username: None,
+            uuid: None,
             amux: Some(false),
             amux_max: Some(8),
             amux_con: Some(2),
             amux_max_recv: Some(0),
             amux_max_lifetime: Some(0),
             quic: Some(false),
+            reality: Some(false),
+            reality_public_key: None,
+            reality_short_id: None,
         }
     }
 }
@@ -119,6 +145,10 @@ pub struct ProxyGroup {
     pub tag: String,
     pub protocol: String,
     pub actors: Option<Vec<String>>,
+
+    // common
+    pub address: Option<String>,
+    pub port: Option<u16>,
 
     // failover
     pub health_check: Option<bool>,
@@ -151,6 +181,8 @@ impl Default for ProxyGroup {
             tag: "".to_string(),
             protocol: "".to_string(),
             actors: None,
+            address: None,
+            port: None,
             health_check: None,
             check_interval: None,
             fail_timeout: None,
@@ -187,6 +219,8 @@ pub struct Config {
     pub proxy_group: Option<Vec<ProxyGroup>>,
     pub rule: Option<Vec<Rule>>,
     pub host: Option<HashMap<String, Vec<String>>>,
+    pub certificates: Option<HashMap<String, String>>,
+    pub ech_configs: Option<HashMap<String, String>>,
 }
 
 fn read_lines<P>(filename: P) -> io::Result<io::Lines<io::BufReader<File>>>
@@ -197,7 +231,7 @@ where
     Ok(io::BufReader::new(file).lines())
 }
 
-fn remove_comments(text: &str) -> Cow<str> {
+fn remove_comments(text: &str) -> Cow<'_, str> {
     let re = Regex::new(r"(#[^*]*)").unwrap();
     re.replace(text, "")
 }
@@ -209,19 +243,174 @@ fn get_section(text: &str) -> Option<&str> {
     Some(caps.unwrap().get(1).unwrap().as_str())
 }
 
+fn normalize_section(s: &str) -> String {
+    s.to_lowercase().replace(' ', "").replace('_', "")
+}
+
+fn get_certificate_sections<'a, I>(lines: I) -> HashMap<String, String>
+where
+    I: Iterator<Item = &'a io::Result<String>>,
+{
+    let mut certificates = HashMap::new();
+    let mut current_name: Option<String> = None;
+    let mut current_lines: Vec<String> = Vec::new();
+
+    for line in lines {
+        let line = match line {
+            Ok(line) => line,
+            Err(_) => continue,
+        };
+        let trimmed = line.trim();
+        if let Some(section) = get_section(trimmed) {
+            if let Some(name) = current_name.take() {
+                if !current_lines.is_empty() {
+                    let mut content = current_lines.join("\n");
+                    content.push('\n');
+                    certificates.insert(name, content);
+                }
+                current_lines.clear();
+            }
+            let lower = section.to_lowercase();
+            if let Some(name) = section.strip_prefix("Certificate.") {
+                let name = name.trim();
+                if !name.is_empty() {
+                    current_name = Some(name.to_string());
+                }
+            } else if lower.starts_with("certificate.") {
+                let name = &section["certificate.".len()..];
+                let name = name.trim();
+                if !name.is_empty() {
+                    current_name = Some(name.to_string());
+                }
+            } else if lower.starts_with("certificate_") {
+                let name = &section["certificate_".len()..];
+                let name = name.trim();
+                if !name.is_empty() {
+                    current_name = Some(name.to_string());
+                }
+            } else if lower.starts_with("certificate ") {
+                let name = &section["certificate ".len()..];
+                let name = name.trim();
+                if !name.is_empty() {
+                    current_name = Some(name.to_string());
+                }
+            } else if lower.starts_with("certificate") {
+                let name = &section["certificate".len()..];
+                let name = name.trim();
+                if !name.is_empty() {
+                    current_name = Some(name.to_string());
+                }
+            }
+            continue;
+        }
+        if current_name.is_some() {
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            current_lines.push(trimmed.to_string());
+        }
+    }
+
+    if let Some(name) = current_name.take() {
+        if !current_lines.is_empty() {
+            let mut content = current_lines.join("\n");
+            content.push('\n');
+            certificates.insert(name, content);
+        }
+    }
+
+    certificates
+}
+
+fn get_ech_sections<'a, I>(lines: I) -> HashMap<String, String>
+where
+    I: Iterator<Item = &'a io::Result<String>>,
+{
+    let mut ech_configs = HashMap::new();
+    let mut current_name: Option<String> = None;
+    let mut current_lines: Vec<String> = Vec::new();
+
+    for line in lines {
+        let line = match line {
+            Ok(line) => line,
+            Err(_) => continue,
+        };
+        let trimmed = line.trim();
+        if let Some(section) = get_section(trimmed) {
+            if let Some(name) = current_name.take() {
+                if !current_lines.is_empty() {
+                    let mut content = current_lines.join("\n");
+                    content.push('\n');
+                    ech_configs.insert(name, content);
+                }
+                current_lines.clear();
+            }
+            let lower = section.to_lowercase();
+            if let Some(name) = section.strip_prefix("Ech.") {
+                let name = name.trim();
+                if !name.is_empty() {
+                    current_name = Some(name.to_string());
+                }
+            } else if lower.starts_with("ech.") {
+                let name = &section["ech.".len()..];
+                let name = name.trim();
+                if !name.is_empty() {
+                    current_name = Some(name.to_string());
+                }
+            } else if lower.starts_with("ech_") {
+                let name = &section["ech_".len()..];
+                let name = name.trim();
+                if !name.is_empty() {
+                    current_name = Some(name.to_string());
+                }
+            } else if lower.starts_with("ech ") {
+                let name = &section["ech ".len()..];
+                let name = name.trim();
+                if !name.is_empty() {
+                    current_name = Some(name.to_string());
+                }
+            } else if lower.starts_with("ech") {
+                let name = &section["ech".len()..];
+                let name = name.trim();
+                if !name.is_empty() {
+                    current_name = Some(name.to_string());
+                }
+            }
+            continue;
+        }
+        if current_name.is_some() {
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            current_lines.push(trimmed.to_string());
+        }
+    }
+
+    if let Some(name) = current_name.take() {
+        if !current_lines.is_empty() {
+            let mut content = current_lines.join("\n");
+            content.push('\n');
+            ech_configs.insert(name, content);
+        }
+    }
+
+    ech_configs
+}
+
 fn get_lines_by_section<'a, I>(section: &str, lines: I) -> Vec<String>
 where
     I: Iterator<Item = &'a io::Result<String>>,
 {
     let mut new_lines = Vec::new();
     let mut curr_sect: String = "".to_string();
+    let normalized_target = normalize_section(section);
     for line in lines.flatten().map(|x| x.trim()) {
         let line = remove_comments(line);
         if let Some(s) = get_section(line.as_ref()) {
             curr_sect = s.to_string();
             continue;
         }
-        if curr_sect.as_str() == section && !line.is_empty() {
+        if normalize_section(&curr_sect) == normalized_target && !line.is_empty() {
             new_lines.push(line.to_string());
         }
     }
@@ -265,6 +454,8 @@ where
 }
 
 pub fn from_lines(lines: Vec<io::Result<String>>) -> Result<Config> {
+    let certificates = get_certificate_sections(lines.iter());
+    let ech_configs = get_ech_sections(lines.iter());
     let env_lines = get_lines_by_section("Env", lines.iter());
     for line in env_lines {
         let parts: Vec<&str> = line
@@ -291,11 +482,11 @@ pub fn from_lines(lines: Vec<io::Result<String>>) -> Result<Config> {
             }
             "tun" => {
                 if let Some(items) = get_char_sep_slice(parts[1], ',') {
-                    if items.len() == 1 {
-                        general.tun_auto = Some(items[0] == "auto");
+                    if items.len() >= 1 && items[0] == "auto" {
+                        general.tun_auto = Some(true);
                         continue;
                     }
-                    if items.len() != 5 {
+                    if items.len() < 5 {
                         continue;
                     }
                     let tun = Tun {
@@ -308,11 +499,32 @@ pub fn from_lines(lines: Vec<io::Result<String>>) -> Result<Config> {
                     general.tun = Some(tun);
                 }
             }
+            "tun2socks-backend" => {
+                general.tun2socks_backend = Some(parts[1].to_string());
+            }
+            "nf" => {
+                // nf = driver_name, path/to/nfapi.dll
+                if let Some(items) = get_char_sep_slice(parts[1], ',') {
+                    let nfapi = if items.len() >= 2 {
+                        Some(items[1].trim().to_owned())
+                    } else {
+                        None
+                    };
+                    let nf = Nf {
+                        driver_name: items[0].trim().to_owned(),
+                        nfapi,
+                    };
+                    general.nf = Some(nf);
+                }
+            }
             "loglevel" => {
                 general.loglevel = Some(parts[1].to_string());
             }
             "logoutput" => {
                 general.logoutput = Some(parts[1].to_string());
+            }
+            "logformat" => {
+                general.logformat = Some(parts[1].to_string());
             }
             "dns-server" => {
                 general.dns_server = get_char_sep_slice(parts[1], ',');
@@ -350,6 +562,12 @@ pub fn from_lines(lines: Vec<io::Result<String>>) -> Result<Config> {
             }
             "api-port" => {
                 general.api_port = get_value::<u16>(parts[1]);
+            }
+            "wintun" => {
+                general.wintun = get_string(parts[1]);
+            }
+            "tun-dns-server" => {
+                general.tun_dns_server = get_char_sep_slice(parts[1], ',');
             }
             _ => {}
         }
@@ -419,6 +637,14 @@ pub fn from_lines(lines: Vec<io::Result<String>>) -> Result<Config> {
                 "tls-insecure" => {
                     proxy.tls_insecure = if v == "true" { Some(true) } else { Some(false) }
                 }
+                "tls-ech" => proxy.tls_ech = if v == "true" { Some(true) } else { Some(false) },
+                "tls-ech-disable-dns-lookup" => {
+                    proxy.tls_ech_disable_dns_lookup =
+                        if v == "true" { Some(true) } else { Some(false) }
+                }
+                "tls-ech-config-list" | "ech-config-list" => {
+                    proxy.tls_ech_config_list = Some(v.to_string());
+                }
                 "ws-path" => {
                     proxy.ws_path = Some(v.to_string());
                 }
@@ -431,40 +657,34 @@ pub fn from_lines(lines: Vec<io::Result<String>>) -> Result<Config> {
                 "username" => {
                     proxy.username = Some(v.to_string());
                 }
+                "uuid" => {
+                    proxy.uuid = Some(v.to_string());
+                }
                 "amux" => proxy.amux = if v == "true" { Some(true) } else { Some(false) },
                 "amux-max" => {
-                    let i = if let Ok(i) = v.parse::<i32>() {
-                        Some(i)
-                    } else {
-                        None
-                    };
+                    let i = v.parse::<i32>().ok();
                     proxy.amux_max = i;
                 }
                 "amux-con" => {
-                    let i = if let Ok(i) = v.parse::<i32>() {
-                        Some(i)
-                    } else {
-                        None
-                    };
+                    let i = v.parse::<i32>().ok();
                     proxy.amux_con = i;
                 }
                 "amux-max-recv" => {
-                    let i = if let Ok(i) = v.parse::<u64>() {
-                        Some(i)
-                    } else {
-                        None
-                    };
+                    let i = v.parse::<u64>().ok();
                     proxy.amux_max_recv = i;
                 }
                 "amux-max-lifetime" => {
-                    let i = if let Ok(i) = v.parse::<u64>() {
-                        Some(i)
-                    } else {
-                        None
-                    };
+                    let i = v.parse::<u64>().ok();
                     proxy.amux_max_lifetime = i;
                 }
                 "quic" => proxy.quic = if v == "true" { Some(true) } else { Some(false) },
+                "reality" => proxy.reality = if v == "true" { Some(true) } else { Some(false) },
+                "reality-public-key" => {
+                    proxy.reality_public_key = Some(v.to_string());
+                }
+                "reality-short-id" => {
+                    proxy.reality_short_id = Some(v.to_string());
+                }
                 "interface" => {
                     proxy.interface = v.to_string();
                 }
@@ -504,6 +724,22 @@ pub fn from_lines(lines: Vec<io::Result<String>>) -> Result<Config> {
             continue; // not valid port
         };
         proxy.port = Some(port);
+
+        // parse positional params
+        let pos_params = &params[2..];
+        for (i, param) in pos_params.iter().enumerate() {
+            if param.contains('=') {
+                continue;
+            }
+            match (proxy.protocol.as_str(), i) {
+                ("ss" | "shadowsocks", 0) => proxy.encrypt_method = Some(param.clone()),
+                ("ss" | "shadowsocks", 1) => proxy.password = Some(param.clone()),
+                ("trojan", 0) => proxy.password = Some(param.clone()),
+                ("vmess", 0) => proxy.username = Some(param.clone()),
+                ("vless", 0) => proxy.password = Some(param.clone()),
+                _ => (),
+            }
+        }
 
         // compat
         if let "ss" = proxy.protocol.as_str() {
@@ -568,15 +804,21 @@ pub fn from_lines(lines: Vec<io::Result<String>>) -> Result<Config> {
                     continue;
                 }
                 match k {
+                    "address" => {
+                        group.address = Some(v.to_string());
+                    }
+                    "port" => {
+                        group.port = v.parse().ok();
+                    }
                     "health-check" => {
                         group.health_check = if v == "true" { Some(true) } else { Some(false) };
                     }
                     "check-interval" => {
-                        let i = if let Ok(i) = v.parse() { Some(i) } else { None };
+                        let i = v.parse().ok();
                         group.check_interval = i;
                     }
                     "fail-timeout" => {
-                        let i = if let Ok(i) = v.parse() { Some(i) } else { None };
+                        let i = v.parse().ok();
                         group.fail_timeout = i;
                     }
                     "failover" => {
@@ -586,11 +828,11 @@ pub fn from_lines(lines: Vec<io::Result<String>>) -> Result<Config> {
                         group.fallback_cache = if v == "true" { Some(true) } else { Some(false) };
                     }
                     "cache-size" => {
-                        let i = if let Ok(i) = v.parse() { Some(i) } else { None };
+                        let i = v.parse().ok();
                         group.cache_size = i;
                     }
                     "cache-timeout" => {
-                        let i = if let Ok(i) = v.parse() { Some(i) } else { None };
+                        let i = v.parse().ok();
                         group.cache_timeout = i;
                     }
                     "last-resort" => {
@@ -601,15 +843,15 @@ pub fn from_lines(lines: Vec<io::Result<String>>) -> Result<Config> {
                         };
                     }
                     "health-check-timeout" => {
-                        let i = if let Ok(i) = v.parse() { Some(i) } else { None };
+                        let i = v.parse().ok();
                         group.health_check_timeout = i;
                     }
                     "health-check-delay" => {
-                        let i = if let Ok(i) = v.parse() { Some(i) } else { None };
+                        let i = v.parse().ok();
                         group.health_check_delay = i;
                     }
                     "health-check-active" => {
-                        let i = if let Ok(i) = v.parse() { Some(i) } else { None };
+                        let i = v.parse().ok();
                         group.health_check_active = i;
                     }
                     "health-check-prefers" => {
@@ -630,15 +872,15 @@ pub fn from_lines(lines: Vec<io::Result<String>>) -> Result<Config> {
                             if v == "true" { Some(true) } else { Some(false) };
                     }
                     "health-check-attempts" => {
-                        let i = if let Ok(i) = v.parse() { Some(i) } else { None };
+                        let i = v.parse().ok();
                         group.health_check_attempts = i;
                     }
                     "health-check-success-percentage" => {
-                        let i = if let Ok(i) = v.parse() { Some(i) } else { None };
+                        let i = v.parse().ok();
                         group.health_check_success_percentage = i;
                     }
                     "delay-base" => {
-                        let i = if let Ok(i) = v.parse() { Some(i) } else { None };
+                        let i = v.parse().ok();
                         group.delay_base = i;
                     }
                     "method" => {
@@ -702,7 +944,7 @@ pub fn from_lines(lines: Vec<io::Result<String>>) -> Result<Config> {
 
         match rule.type_field.as_str() {
             "IP-CIDR" | "DOMAIN" | "DOMAIN-SUFFIX" | "DOMAIN-KEYWORD" | "GEOIP" | "EXTERNAL"
-            | "PORT-RANGE" | "NETWORK" | "INBOUND-TAG" => {
+            | "PORT-RANGE" | "NETWORK" | "INBOUND-TAG" | "PROCESS-NAME" => {
                 rule.filter = Some(params[1].to_string());
             }
             _ => {}
@@ -733,522 +975,454 @@ pub fn from_lines(lines: Vec<io::Result<String>>) -> Result<Config> {
         proxy_group: Some(proxy_groups),
         rule: Some(rules),
         host: Some(hosts),
+        certificates: if certificates.is_empty() {
+            None
+        } else {
+            Some(certificates)
+        },
+        ech_configs: if ech_configs.is_empty() {
+            None
+        } else {
+            Some(ech_configs)
+        },
     })
 }
 
-pub fn to_internal(conf: &mut Config) -> Result<internal::Config> {
-    let mut log = internal::Log::new();
-    if let Some(ext_general) = &conf.general {
-        if let Some(ext_loglevel) = &ext_general.loglevel {
-            match ext_loglevel.to_lowercase().as_str() {
-                "trace" => log.level = protobuf::EnumOrUnknown::new(internal::log::Level::TRACE),
-                "debug" => log.level = protobuf::EnumOrUnknown::new(internal::log::Level::DEBUG),
-                "info" => log.level = protobuf::EnumOrUnknown::new(internal::log::Level::INFO),
-                "warn" => log.level = protobuf::EnumOrUnknown::new(internal::log::Level::WARN),
-                "error" => log.level = protobuf::EnumOrUnknown::new(internal::log::Level::ERROR),
-                "none" => log.level = protobuf::EnumOrUnknown::new(internal::log::Level::NONE),
-                _ => log.level = protobuf::EnumOrUnknown::new(internal::log::Level::WARN),
-            }
-        }
-        if let Some(ext_logoutput) = &ext_general.logoutput {
-            match ext_logoutput.as_str() {
-                "console" => {
-                    log.output = protobuf::EnumOrUnknown::new(internal::log::Output::CONSOLE)
-                }
-                _ => {
-                    log.output = protobuf::EnumOrUnknown::new(internal::log::Output::FILE);
-                    log.output_file = ext_logoutput.clone();
-                }
-            }
-        }
-    }
+pub fn to_common(conf: &Config) -> Result<common::Config> {
+    let mut common_config = common::Config::default();
 
-    let mut inbounds = Vec::new();
     if let Some(ext_general) = &conf.general {
-        if ext_general.http_interface.is_some() && ext_general.http_port.is_some() {
-            let mut inbound = internal::Inbound::new();
-            inbound.protocol = "http".to_string();
-            inbound.tag = "http".to_string();
-            inbound.address = ext_general.http_interface.as_ref().unwrap().to_string();
-            inbound.port = ext_general.http_port.unwrap() as u32;
-            inbounds.push(inbound);
+        let log = common::Log {
+            level: ext_general.loglevel.clone(),
+            output: ext_general.logoutput.clone(),
+            format: ext_general.logformat.clone(),
+        };
+        common_config.log = Some(log);
+
+        let mut inbounds = Vec::new();
+
+        if let (Some(interface), Some(port)) = (
+            ext_general.http_interface.as_ref(),
+            ext_general.http_port.as_ref(),
+        ) {
+            inbounds.push(common::Inbound {
+                tag: Some("http".to_string()),
+                address: Some(interface.clone()),
+                port: Some(*port),
+                settings: common::InboundSettings::Http,
+            });
         }
-        if ext_general.socks_interface.is_some() && ext_general.socks_port.is_some() {
-            let mut inbound = internal::Inbound::new();
-            inbound.protocol = "socks".to_string();
-            inbound.tag = "socks".to_string();
-            inbound.address = ext_general.socks_interface.as_ref().unwrap().to_string();
-            inbound.port = ext_general.socks_port.unwrap() as u32;
-            inbounds.push(inbound);
+
+        if let (Some(interface), Some(port)) = (
+            ext_general.socks_interface.as_ref(),
+            ext_general.socks_port.as_ref(),
+        ) {
+            inbounds.push(common::Inbound {
+                tag: Some("socks".to_string()),
+                address: Some(interface.clone()),
+                port: Some(*port),
+                settings: common::InboundSettings::Socks { settings: None },
+            });
+        }
+
+        if let Some(nf) = &ext_general.nf {
+            inbounds.push(common::Inbound {
+                tag: Some("nf".to_string()),
+                address: Some("127.0.0.1".to_string()),
+                port: Some(0),
+                settings: common::InboundSettings::Nf {
+                    settings: Some(common::NfInboundSettings {
+                        driver_name: nf.driver_name.clone(),
+                        nfapi: nf.nfapi.clone(),
+                        fake_dns_exclude: ext_general.always_real_ip.clone(),
+                        fake_dns_include: ext_general.always_fake_ip.clone(),
+                        tun2socks: None,
+                    }),
+                },
+            });
         }
 
         if ext_general.tun_fd.is_some()
             || ext_general.tun_auto.is_some()
             || ext_general.tun.is_some()
         {
-            let mut inbound = internal::Inbound::new();
-            inbound.protocol = "tun".to_string();
-            inbound.tag = "tun".to_string();
-            let mut settings = internal::TunInboundSettings::new();
+            let mut settings = common::TunInboundSettings {
+                auto: None,
+                fd: None,
+                name: None,
+                address: None,
+                gateway: None,
+                netmask: None,
+                mtu: None,
+                fake_dns_exclude: ext_general.always_real_ip.clone(),
+                fake_dns_include: ext_general.always_fake_ip.clone(),
+                tun2socks: ext_general.tun2socks_backend.clone(),
+                wintun: ext_general.wintun.clone(),
+                dns_servers: ext_general.tun_dns_server.clone(),
+            };
 
-            let mut fake_dns_exclude = Vec::new();
-            if let Some(ext_always_real_ip) = &ext_general.always_real_ip {
-                for item in ext_always_real_ip {
-                    fake_dns_exclude.push(item.clone())
+            if let Some(fd) = ext_general.tun_fd {
+                settings.fd = Some(fd);
+            } else if let Some(auto) = ext_general.tun_auto {
+                if auto {
+                    settings.auto = Some(true);
+                    settings.fd = Some(-1);
                 }
-                if !fake_dns_exclude.is_empty() {
-                    settings.fake_dns_exclude = fake_dns_exclude;
-                }
+            } else if let Some(ext_tun) = &ext_general.tun {
+                settings.fd = Some(-1);
+                settings.name = ext_tun.name.clone();
+                settings.address = ext_tun.address.clone();
+                settings.gateway = ext_tun.gateway.clone();
+                settings.netmask = ext_tun.netmask.clone();
+                settings.mtu = ext_tun.mtu;
             }
 
-            let mut fake_dns_include = Vec::new();
-            if let Some(ext_always_fake_ip) = &ext_general.always_fake_ip {
-                for item in ext_always_fake_ip {
-                    fake_dns_include.push(item.clone())
-                }
-                if !fake_dns_include.is_empty() {
-                    settings.fake_dns_include = fake_dns_include;
-                }
-            }
-
-            if ext_general.tun_fd.is_some() {
-                settings.fd = ext_general.tun_fd.unwrap();
-            } else if ext_general.tun_auto.is_some() && ext_general.tun_auto.unwrap() {
-                settings.auto = true;
-                settings.fd = -1; // disable fd option
-            } else {
-                let ext_tun = ext_general.tun.as_ref().unwrap();
-
-                settings.fd = -1; // disable fd option
-                if let Some(ext_name) = &ext_tun.name {
-                    settings.name = ext_name.clone();
-                }
-                if let Some(ext_address) = &ext_tun.address {
-                    settings.address = ext_address.clone();
-                }
-                if let Some(ext_gateway) = &ext_tun.gateway {
-                    settings.gateway = ext_gateway.clone();
-                }
-                if let Some(ext_netmask) = &ext_tun.netmask {
-                    settings.netmask = ext_netmask.clone();
-                }
-                if let Some(ext_mtu) = ext_tun.mtu {
-                    settings.mtu = ext_mtu;
-                } else {
-                    settings.mtu = 1500;
-                }
-            }
-
-            // TODO tun opts
-            let settings = settings.write_to_bytes().unwrap();
-            inbound.settings = settings;
-            inbounds.push(inbound);
+            inbounds.push(common::Inbound {
+                tag: Some("tun".to_string()),
+                address: None,
+                port: None,
+                settings: common::InboundSettings::Tun {
+                    settings: Some(settings),
+                },
+            });
         }
+
+        // if let (Some(interface), Some(port)) = (
+        //     ext_general.api_interface.as_ref(),
+        //     ext_general.api_port.as_ref(),
+        // ) {
+        // The API inbound is actually an HTTP inbound with specific handling in the core
+        // but in common config it might be represented differently or just not supported in this way
+        // Looking at the original code, there was no API inbound handling in `to_common`
+        // I added it because I saw `api_interface` in `General` struct.
+        // But if `common::InboundSettings` doesn't support it, I should probably remove it or map to something else.
+        // However, leaf usually handles API via a separate server, not necessarily a standard inbound.
+        // Let's remove this block for now to fix the compilation error, as the user asked for `tun` config support, not API.
+        // }
+
+        common_config.inbounds = Some(inbounds);
     }
 
     let mut outbounds = Vec::new();
+    let certificates = conf.certificates.as_ref();
+    let ech_configs = conf.ech_configs.as_ref();
+    let resolve_cert = |value: &Option<String>| -> Option<String> {
+        let value = value.as_ref()?;
+        if let Some(certificates) = certificates {
+            if let Some(content) = certificates.get(value) {
+                return Some(content.clone());
+            }
+        }
+        Some(value.clone())
+    };
+    let resolve_ech = |value: &Option<String>| -> Option<String> {
+        let value = value.as_ref()?;
+        if let Some(ech_configs) = ech_configs {
+            if let Some(content) = ech_configs.get(value) {
+                return Some(content.clone());
+            }
+        }
+        Some(value.clone())
+    };
     if let Some(ext_proxies) = &conf.proxy {
         for ext_proxy in ext_proxies {
-            let mut outbound = internal::Outbound::new();
-            let ext_protocol = match ext_proxy.protocol.as_str() {
+            let protocol = match ext_proxy.protocol.as_str() {
                 "ss" => "shadowsocks",
                 _ => &ext_proxy.protocol,
             };
-            outbound.protocol = ext_protocol.to_string();
-            outbound.tag = ext_proxy.tag.clone();
-            match outbound.protocol.as_str() {
-                "direct" | "drop" => {
-                    outbounds.push(outbound);
+
+            match protocol {
+                "direct" => {
+                    outbounds.push(common::Outbound {
+                        tag: Some(ext_proxy.tag.clone()),
+                        settings: common::OutboundSettings::Direct,
+                    });
+                }
+                "drop" => {
+                    outbounds.push(common::Outbound {
+                        tag: Some(ext_proxy.tag.clone()),
+                        settings: common::OutboundSettings::Drop,
+                    });
                 }
                 "redirect" => {
-                    let mut settings = internal::RedirectOutboundSettings::new();
-                    if let Some(ext_address) = &ext_proxy.address {
-                        settings.address = ext_address.clone();
-                    }
-                    if let Some(ext_port) = &ext_proxy.port {
-                        settings.port = *ext_port as u32;
-                    }
-                    let settings = settings.write_to_bytes().unwrap();
-                    outbound.settings = settings;
-                    outbounds.push(outbound);
+                    outbounds.push(common::Outbound {
+                        tag: Some(ext_proxy.tag.clone()),
+                        settings: common::OutboundSettings::Redirect {
+                            settings: Some(common::RedirectOutboundSettings {
+                                address: ext_proxy.address.clone(),
+                                port: ext_proxy.port,
+                            }),
+                        },
+                    });
                 }
                 "socks" => {
-                    let mut settings = internal::SocksOutboundSettings::new();
-                    if let Some(ext_address) = &ext_proxy.address {
-                        settings.address = ext_address.clone();
-                    }
-                    if let Some(ext_port) = &ext_proxy.port {
-                        settings.port = *ext_port as u32;
-                    }
-                    if let Some(ext_username) = &ext_proxy.username {
-                        settings.username = ext_username.clone();
-                    }
-                    if let Some(ext_password) = &ext_proxy.password {
-                        settings.password = ext_password.clone();
-                    }
-                    let settings = settings.write_to_bytes().unwrap();
-                    outbound.settings = settings;
-                    outbounds.push(outbound);
+                    outbounds.push(common::Outbound {
+                        tag: Some(ext_proxy.tag.clone()),
+                        settings: common::OutboundSettings::Socks {
+                            settings: Some(common::SocksOutboundSettings {
+                                address: ext_proxy.address.clone(),
+                                port: ext_proxy.port,
+                                username: ext_proxy.username.clone(),
+                                password: ext_proxy.password.clone(),
+                            }),
+                        },
+                    });
                 }
                 "shadowsocks" => {
-                    let mut settings = internal::ShadowsocksOutboundSettings::new();
-                    if let Some(ext_address) = &ext_proxy.address {
-                        settings.address = ext_address.clone();
-                    }
-                    if let Some(ext_port) = &ext_proxy.port {
-                        settings.port = *ext_port as u32;
-                    }
-                    if let Some(ext_encrypt_method) = &ext_proxy.encrypt_method {
-                        settings.method = ext_encrypt_method.clone();
-                    } else {
-                        settings.method = "chacha20-ietf-poly1305".to_string();
-                    }
-                    settings.prefix = ext_proxy.prefix.clone();
-                    if let Some(ext_password) = &ext_proxy.password {
-                        settings.password = ext_password.clone();
-                    }
+                    let settings = common::ShadowsocksOutboundSettings {
+                        address: ext_proxy.address.clone(),
+                        port: ext_proxy.port,
+                        method: ext_proxy.encrypt_method.clone(),
+                        password: ext_proxy.password.clone(),
+                        prefix: ext_proxy.prefix.clone(),
+                    };
+
                     if let Some(obfs) = &ext_proxy.obfs_type {
-                        outbound.tag = format!("{}_ss_xxx", ext_proxy.tag.clone());
-                        // obfs
-                        let mut obfs_outbound = internal::Outbound::new();
-                        obfs_outbound.protocol = "obfs".to_string();
-                        let mut obfs_settings = internal::ObfsOutboundSettings::new();
-                        obfs_settings.method = obfs.clone();
-                        if let Some(ext_obfs_host) = &ext_proxy.obfs_host {
-                            obfs_settings.host = ext_obfs_host.clone();
-                        }
-                        obfs_settings.path =
-                            ext_proxy.obfs_path.as_deref().unwrap_or("/").to_string();
-                        let obfs_settings = obfs_settings.write_to_bytes().unwrap();
-                        obfs_outbound.settings = obfs_settings;
-                        obfs_outbound.tag = format!("{}_obfs_xxx", ext_proxy.tag.clone());
+                        let ss_tag = format!("{}_ss_xxx", ext_proxy.tag);
+                        let obfs_tag = format!("{}_obfs_xxx", ext_proxy.tag);
 
-                        // chain
-                        let mut chain_outbound = internal::Outbound::new();
-                        chain_outbound.tag = ext_proxy.tag.clone();
-                        let mut chain_settings = internal::ChainOutboundSettings::new();
-                        chain_settings.actors.push(obfs_outbound.tag.clone());
-                        chain_settings.actors.push(outbound.tag.clone());
-                        let chain_settings = chain_settings.write_to_bytes().unwrap();
-                        chain_outbound.settings = chain_settings;
-                        chain_outbound.protocol = "chain".to_string();
+                        outbounds.push(common::Outbound {
+                            tag: Some(ext_proxy.tag.clone()),
+                            settings: common::OutboundSettings::Chain {
+                                settings: Some(common::ChainOutboundSettings {
+                                    actors: Some(vec![obfs_tag.clone(), ss_tag.clone()]),
+                                }),
+                            },
+                        });
 
-                        // always push chain first, in case there isn't final rule,
-                        // the chain outbound will be the default one to use
-                        outbounds.push(chain_outbound);
-                        outbounds.push(obfs_outbound);
+                        outbounds.push(common::Outbound {
+                            tag: Some(obfs_tag),
+                            settings: common::OutboundSettings::Obfs {
+                                settings: Some(common::ObfsOutboundSettings {
+                                    method: Some(obfs.clone()),
+                                    host: ext_proxy.obfs_host.clone(),
+                                    path: Some(
+                                        ext_proxy.obfs_path.as_deref().unwrap_or("/").to_string(),
+                                    ),
+                                }),
+                            },
+                        });
+
+                        outbounds.push(common::Outbound {
+                            tag: Some(ss_tag),
+                            settings: common::OutboundSettings::Shadowsocks {
+                                settings: Some(settings),
+                            },
+                        });
+                    } else {
+                        outbounds.push(common::Outbound {
+                            tag: Some(ext_proxy.tag.clone()),
+                            settings: common::OutboundSettings::Shadowsocks {
+                                settings: Some(settings),
+                            },
+                        });
                     }
-                    let settings = settings.write_to_bytes().unwrap();
-                    outbound.settings = settings;
-                    outbounds.push(outbound);
                 }
-                "trojan" => {
+                "vless" => {
+                    let settings = common::VlessOutboundSettings {
+                        address: ext_proxy.address.clone(),
+                        port: ext_proxy.port,
+                        uuid: ext_proxy
+                            .uuid
+                            .clone()
+                            .or_else(|| ext_proxy.password.clone()), // prioritize uuid, then password
+                    };
+
+                    let mut next_tag = ext_proxy.tag.clone();
+
+                    if ext_proxy.reality.unwrap_or(false) {
+                        let reality_tag = format!("{}_reality_xxx", ext_proxy.tag);
+                        outbounds.push(common::Outbound {
+                            tag: Some(ext_proxy.tag.clone()),
+                            settings: common::OutboundSettings::Chain {
+                                settings: Some(common::ChainOutboundSettings {
+                                    actors: Some(vec![
+                                        reality_tag.clone(),
+                                        format!("{}_vless_xxx", ext_proxy.tag),
+                                    ]),
+                                }),
+                            },
+                        });
+
+                        outbounds.push(common::Outbound {
+                            tag: Some(reality_tag),
+                            settings: common::OutboundSettings::Reality {
+                                settings: Some(common::RealityOutboundSettings {
+                                    server_name: ext_proxy.sni.clone(),
+                                    public_key: ext_proxy.reality_public_key.clone(),
+                                    short_id: ext_proxy.reality_short_id.clone(),
+                                }),
+                            },
+                        });
+
+                        next_tag = format!("{}_vless_xxx", ext_proxy.tag);
+                    }
+
+                    outbounds.push(common::Outbound {
+                        tag: Some(next_tag),
+                        settings: common::OutboundSettings::Vless {
+                            settings: Some(settings),
+                        },
+                    });
+                }
+                "trojan" | "vmess" => {
+                    let mut actors = Vec::new();
+                    let mut component_outbounds = Vec::new();
+
                     // tls
-                    let mut tls_outbound = internal::Outbound::new();
-                    tls_outbound.protocol = "tls".to_string();
-                    let mut tls_settings = internal::TlsOutboundSettings::new();
-                    if let Some(ext_sni) = &ext_proxy.sni {
-                        tls_settings.server_name = ext_sni.clone();
-                    }
-                    if let Some(ext_tls_cert) = &ext_proxy.tls_cert {
-                        let cert = Path::new(ext_tls_cert);
-                        if cert.is_absolute() {
-                            tls_settings.certificate = cert.to_string_lossy().to_string();
-                        } else {
-                            let asset_loc = Path::new(&*crate::option::ASSET_LOCATION);
-                            let path = asset_loc.join(cert).to_string_lossy().to_string();
-                            tls_settings.certificate = path;
-                        }
-                    }
-                    tls_settings.insecure = ext_proxy.tls_insecure.unwrap_or_default();
-                    let tls_settings = tls_settings.write_to_bytes().unwrap();
-                    tls_outbound.settings = tls_settings;
-                    tls_outbound.tag = format!("{}_tls_xxx", ext_proxy.tag.clone());
+                    let tls_tag = format!("{}_tls_xxx", ext_proxy.tag);
+                    component_outbounds.push(common::Outbound {
+                        tag: Some(tls_tag.clone()),
+                        settings: common::OutboundSettings::Tls {
+                            settings: Some(common::TlsOutboundSettings {
+                                server_name: ext_proxy.sni.clone(),
+                                alpn: if protocol == "trojan" {
+                                    None
+                                } else {
+                                    Some(vec!["http/1.1".to_string()])
+                                },
+                                certificate: resolve_cert(&ext_proxy.tls_cert),
+                                certificate_key: None,
+                                raw_certificate: None,
+                                raw_certificate_key: None,
+                                insecure: ext_proxy.tls_insecure,
+                                ech: ext_proxy.tls_ech,
+                                ech_disable_dns_lookup: ext_proxy.tls_ech_disable_dns_lookup,
+                                ech_config_list: resolve_ech(&ext_proxy.tls_ech_config_list),
+                            }),
+                        },
+                    });
 
                     // ws
-                    let mut ws_outbound = internal::Outbound::new();
-                    ws_outbound.protocol = "ws".to_string();
-                    let mut ws_settings = internal::WebSocketOutboundSettings::new();
-                    if let Some(ext_ws_path) = &ext_proxy.ws_path {
-                        ws_settings.path = ext_ws_path.clone();
+                    let ws_tag = format!("{}_ws_xxx", ext_proxy.tag);
+                    let mut ws_headers = HashMap::new();
+                    if let Some(host) = &ext_proxy.ws_host {
+                        ws_headers.insert("Host".to_string(), host.clone());
+                    }
+                    component_outbounds.push(common::Outbound {
+                        tag: Some(ws_tag.clone()),
+                        settings: common::OutboundSettings::WebSocket {
+                            settings: Some(common::WebSocketOutboundSettings {
+                                path: Some(ext_proxy.ws_path.as_deref().unwrap_or("/").to_string()),
+                                headers: if ws_headers.is_empty() {
+                                    None
+                                } else {
+                                    Some(ws_headers)
+                                },
+                            }),
+                        },
+                    });
+
+                    // amux or quic or tls/ws
+                    if ext_proxy.amux.unwrap_or(false) {
+                        let amux_tag = format!("{}_amux_xxx", ext_proxy.tag);
+                        let mut amux_actors = vec![tls_tag.clone()];
+                        if ext_proxy.ws.unwrap_or(false) {
+                            amux_actors.push(ws_tag.clone());
+                        }
+                        component_outbounds.push(common::Outbound {
+                            tag: Some(amux_tag.clone()),
+                            settings: common::OutboundSettings::AMux {
+                                settings: Some(common::AMuxOutboundSettings {
+                                    address: ext_proxy.address.clone(),
+                                    port: ext_proxy.port,
+                                    actors: Some(amux_actors),
+                                    max_accepts: ext_proxy.amux_max.map(|x| x as u32),
+                                    concurrency: ext_proxy.amux_con.map(|x| x as u32),
+                                    max_recv_bytes: ext_proxy.amux_max_recv,
+                                    max_lifetime: ext_proxy.amux_max_lifetime,
+                                }),
+                            },
+                        });
+                        actors.push(amux_tag);
+                    } else if ext_proxy.quic.unwrap_or(false) {
+                        let quic_tag = format!("{}_quic_xxx", ext_proxy.tag);
+                        component_outbounds.push(common::Outbound {
+                            tag: Some(quic_tag.clone()),
+                            settings: common::OutboundSettings::Quic {
+                                settings: Some(common::QuicOutboundSettings {
+                                    address: ext_proxy.address.clone(),
+                                    port: ext_proxy.port,
+                                    server_name: ext_proxy.sni.clone(),
+                                    certificate: resolve_cert(&ext_proxy.tls_cert),
+                                    certificate_key: None,
+                                    raw_certificate: None,
+                                    raw_certificate_key: None,
+                                    alpn: Some(vec!["http/1.1".to_string()]),
+                                }),
+                            },
+                        });
+                        actors.push(quic_tag);
                     } else {
-                        ws_settings.path = "/".to_string();
+                        actors.push(tls_tag);
+                        if ext_proxy.ws.unwrap_or(false) {
+                            actors.push(ws_tag);
+                        }
                     }
-                    if let Some(ext_ws_host) = &ext_proxy.ws_host {
-                        let mut headers = HashMap::new();
-                        headers.insert("Host".to_string(), ext_ws_host.clone());
-                        ws_settings.headers = headers;
-                    }
-                    let ws_settings = ws_settings.write_to_bytes().unwrap();
-                    ws_outbound.settings = ws_settings;
-                    ws_outbound.tag = format!("{}_ws_xxx", ext_proxy.tag.clone());
 
-                    // amux
-                    let mut amux_outbound = internal::Outbound::new();
-                    amux_outbound.tag = ext_proxy.tag.clone();
-                    let mut amux_settings = internal::AMuxOutboundSettings::new();
-                    // always enable tls for trojan
-                    amux_settings.actors.push(tls_outbound.tag.clone());
-                    if ext_proxy.ws.unwrap() {
-                        amux_settings.actors.push(ws_outbound.tag.clone());
+                    // core protocol
+                    let core_tag = format!("{}_{}_xxx", ext_proxy.tag, protocol);
+                    if protocol == "trojan" {
+                        component_outbounds.push(common::Outbound {
+                            tag: Some(core_tag.clone()),
+                            settings: common::OutboundSettings::Trojan {
+                                settings: Some(common::TrojanOutboundSettings {
+                                    address: if ext_proxy.amux.unwrap_or(false) {
+                                        None
+                                    } else {
+                                        ext_proxy.address.clone()
+                                    },
+                                    port: if ext_proxy.amux.unwrap_or(false) {
+                                        None
+                                    } else {
+                                        ext_proxy.port
+                                    },
+                                    password: ext_proxy.password.clone(),
+                                }),
+                            },
+                        });
+                    } else {
+                        component_outbounds.push(common::Outbound {
+                            tag: Some(core_tag.clone()),
+                            settings: common::OutboundSettings::VMess {
+                                settings: Some(common::VMessOutboundSettings {
+                                    address: if ext_proxy.amux.unwrap_or(false) {
+                                        None
+                                    } else {
+                                        ext_proxy.address.clone()
+                                    },
+                                    port: if ext_proxy.amux.unwrap_or(false) {
+                                        None
+                                    } else {
+                                        ext_proxy.port
+                                    },
+                                    uuid: ext_proxy
+                                        .uuid
+                                        .clone()
+                                        .or_else(|| ext_proxy.username.clone()),
+                                    security: Some(
+                                        ext_proxy
+                                            .encrypt_method
+                                            .as_deref()
+                                            .unwrap_or("chacha20-ietf-poly1305")
+                                            .to_string(),
+                                    ),
+                                }),
+                            },
+                        });
                     }
-                    if let Some(ext_address) = &ext_proxy.address {
-                        amux_settings.address = ext_address.clone();
-                    }
-                    if let Some(ext_port) = &ext_proxy.port {
-                        amux_settings.port = *ext_port as u32;
-                    }
-                    if let Some(ext_max_accepts) = &ext_proxy.amux_max {
-                        amux_settings.max_accepts = *ext_max_accepts as u32;
-                    }
-                    if let Some(ext_concurrency) = &ext_proxy.amux_con {
-                        amux_settings.concurrency = *ext_concurrency as u32;
-                    }
-                    amux_settings.max_recv_bytes = ext_proxy.amux_max_recv.unwrap_or_default();
-                    amux_settings.max_lifetime = ext_proxy.amux_max_lifetime.unwrap_or_default();
-                    let amux_settings = amux_settings.write_to_bytes().unwrap();
-                    amux_outbound.settings = amux_settings;
-                    amux_outbound.protocol = "amux".to_string();
-                    amux_outbound.tag = format!("{}_amux_xxx", ext_proxy.tag.clone());
-                    // quic
-                    let mut quic_outbound = internal::Outbound::new();
-                    quic_outbound.tag = ext_proxy.tag.clone();
-                    let mut quic_settings = internal::QuicOutboundSettings::new();
-                    if let Some(ext_address) = &ext_proxy.address {
-                        quic_settings.address = ext_address.clone();
-                    }
-                    if let Some(ext_port) = &ext_proxy.port {
-                        quic_settings.port = *ext_port as u32;
-                    }
-                    if let Some(ext_sni) = &ext_proxy.sni {
-                        quic_settings.server_name = ext_sni.clone();
-                    }
-                    quic_settings.alpn = vec!["http/1.1".to_string()];
-                    if let Some(ext_tls_cert) = &ext_proxy.tls_cert {
-                        let cert = Path::new(ext_tls_cert);
-                        if cert.is_absolute() {
-                            quic_settings.certificate = cert.to_string_lossy().to_string();
-                        } else {
-                            let asset_loc = Path::new(&*crate::option::ASSET_LOCATION);
-                            let path = asset_loc.join(cert).to_string_lossy().to_string();
-                            quic_settings.certificate = path;
-                        }
-                    }
-                    let quic_settings = quic_settings.write_to_bytes().unwrap();
-                    quic_outbound.settings = quic_settings;
-                    quic_outbound.protocol = "quic".to_string();
-                    quic_outbound.tag = format!("{}_quic_xxx", ext_proxy.tag.clone());
-
-                    // plain trojan
-                    let mut settings = internal::TrojanOutboundSettings::new();
-                    if !ext_proxy.amux.unwrap() {
-                        if let Some(ext_address) = &ext_proxy.address {
-                            settings.address = ext_address.clone();
-                        }
-                        if let Some(ext_port) = &ext_proxy.port {
-                            settings.port = *ext_port as u32;
-                        }
-                    }
-                    if let Some(ext_password) = &ext_proxy.password {
-                        settings.password = ext_password.clone();
-                    }
-                    let settings = settings.write_to_bytes().unwrap();
-                    outbound.settings = settings;
-                    outbound.tag = format!("{}_trojan_xxx", ext_proxy.tag.clone());
+                    actors.push(core_tag);
 
                     // chain
-                    let mut chain_outbound = internal::Outbound::new();
-                    chain_outbound.tag = ext_proxy.tag.clone();
-                    let mut chain_settings = internal::ChainOutboundSettings::new();
-                    if ext_proxy.amux.unwrap() {
-                        chain_settings.actors.push(amux_outbound.tag.clone());
-                    } else if ext_proxy.quic.unwrap() {
-                        chain_settings.actors.push(quic_outbound.tag.clone());
-                    } else {
-                        chain_settings.actors.push(tls_outbound.tag.clone());
-                        if ext_proxy.ws.unwrap() {
-                            chain_settings.actors.push(ws_outbound.tag.clone());
-                        }
-                    }
-                    chain_settings.actors.push(outbound.tag.clone());
-                    let chain_settings = chain_settings.write_to_bytes().unwrap();
-                    chain_outbound.settings = chain_settings;
-                    chain_outbound.protocol = "chain".to_string();
-
-                    // always push chain first, in case there isn't final rule,
-                    // the chain outbound will be the default one to use
-                    outbounds.push(chain_outbound);
-                    if ext_proxy.amux.unwrap() {
-                        outbounds.push(amux_outbound);
-                    }
-                    if ext_proxy.quic.unwrap() {
-                        outbounds.push(quic_outbound);
-                    } else {
-                        outbounds.push(tls_outbound);
-                    }
-                    if ext_proxy.ws.unwrap() {
-                        outbounds.push(ws_outbound);
-                    }
-                    outbounds.push(outbound);
-                }
-                "vmess" => {
-                    // tls
-                    let mut tls_outbound = internal::Outbound::new();
-                    tls_outbound.protocol = "tls".to_string();
-                    let mut tls_settings = internal::TlsOutboundSettings::new();
-                    if let Some(ext_sni) = &ext_proxy.sni {
-                        tls_settings.server_name = ext_sni.clone();
-                    }
-                    if let Some(ext_tls_cert) = &ext_proxy.tls_cert {
-                        let cert = Path::new(ext_tls_cert);
-                        if cert.is_absolute() {
-                            tls_settings.certificate = cert.to_string_lossy().to_string();
-                        } else {
-                            let asset_loc = Path::new(&*crate::option::ASSET_LOCATION);
-                            let path = asset_loc.join(cert).to_string_lossy().to_string();
-                            tls_settings.certificate = path;
-                        }
-                    }
-                    tls_settings.insecure = ext_proxy.tls_insecure.unwrap_or_default();
-                    let tls_settings = tls_settings.write_to_bytes().unwrap();
-                    tls_outbound.settings = tls_settings;
-                    tls_outbound.tag = format!("{}_tls_xxx", ext_proxy.tag.clone());
-
-                    // ws
-                    let mut ws_outbound = internal::Outbound::new();
-                    ws_outbound.protocol = "ws".to_string();
-                    let mut ws_settings = internal::WebSocketOutboundSettings::new();
-                    if let Some(ext_ws_path) = &ext_proxy.ws_path {
-                        ws_settings.path = ext_ws_path.clone();
-                    } else {
-                        ws_settings.path = "/".to_string();
-                    }
-                    if let Some(ext_ws_host) = &ext_proxy.ws_host {
-                        let mut headers = HashMap::new();
-                        headers.insert("Host".to_string(), ext_ws_host.clone());
-                        ws_settings.headers = headers;
-                    }
-                    let ws_settings = ws_settings.write_to_bytes().unwrap();
-                    ws_outbound.settings = ws_settings;
-                    ws_outbound.tag = format!("{}_ws_xxx", ext_proxy.tag.clone());
-
-                    // amux
-                    let mut amux_outbound = internal::Outbound::new();
-                    amux_outbound.tag = ext_proxy.tag.clone();
-                    let mut amux_settings = internal::AMuxOutboundSettings::new();
-                    // always enable tls for trojan
-                    amux_settings.actors.push(tls_outbound.tag.clone());
-                    if ext_proxy.ws.unwrap() {
-                        amux_settings.actors.push(ws_outbound.tag.clone());
-                    }
-                    if let Some(ext_address) = &ext_proxy.address {
-                        amux_settings.address = ext_address.clone();
-                    }
-                    if let Some(ext_port) = &ext_proxy.port {
-                        amux_settings.port = *ext_port as u32;
-                    }
-                    if let Some(ext_max_accepts) = &ext_proxy.amux_max {
-                        amux_settings.max_accepts = *ext_max_accepts as u32;
-                    }
-                    if let Some(ext_concurrency) = &ext_proxy.amux_con {
-                        amux_settings.concurrency = *ext_concurrency as u32;
-                    }
-                    let amux_settings = amux_settings.write_to_bytes().unwrap();
-                    amux_outbound.settings = amux_settings;
-                    amux_outbound.protocol = "amux".to_string();
-                    amux_outbound.tag = format!("{}_amux_xxx", ext_proxy.tag.clone());
-                    // quic
-                    let mut quic_outbound = internal::Outbound::new();
-                    quic_outbound.tag = ext_proxy.tag.clone();
-                    let mut quic_settings = internal::QuicOutboundSettings::new();
-                    if let Some(ext_address) = &ext_proxy.address {
-                        quic_settings.address = ext_address.clone();
-                    }
-                    if let Some(ext_port) = &ext_proxy.port {
-                        quic_settings.port = *ext_port as u32;
-                    }
-                    if let Some(ext_sni) = &ext_proxy.sni {
-                        quic_settings.server_name = ext_sni.clone();
-                    }
-                    if let Some(ext_tls_cert) = &ext_proxy.tls_cert {
-                        let cert = Path::new(ext_tls_cert);
-                        if cert.is_absolute() {
-                            quic_settings.certificate = cert.to_string_lossy().to_string();
-                        } else {
-                            let asset_loc = Path::new(&*crate::option::ASSET_LOCATION);
-                            let path = asset_loc.join(cert).to_string_lossy().to_string();
-                            quic_settings.certificate = path;
-                        }
-                    }
-                    let quic_settings = quic_settings.write_to_bytes().unwrap();
-                    quic_outbound.settings = quic_settings;
-                    quic_outbound.protocol = "quic".to_string();
-                    quic_outbound.tag = format!("{}_quic_xxx", ext_proxy.tag.clone());
-
-                    // plain vmess
-                    let mut settings = internal::VMessOutboundSettings::new();
-                    if !ext_proxy.amux.unwrap() {
-                        if let Some(ext_address) = &ext_proxy.address {
-                            settings.address = ext_address.clone();
-                        }
-                        if let Some(ext_port) = &ext_proxy.port {
-                            settings.port = *ext_port as u32;
-                        }
-                    }
-                    if let Some(ext_username) = &ext_proxy.username {
-                        settings.uuid = ext_username.clone();
-                    }
-                    if let Some(ext_encrypt_method) = &ext_proxy.encrypt_method {
-                        settings.security = ext_encrypt_method.clone();
-                    } else {
-                        settings.security = "chacha20-ietf-poly1305".to_string();
-                    }
-                    let settings = settings.write_to_bytes().unwrap();
-                    outbound.settings = settings;
-                    outbound.tag = format!("{}_vmess_xxx", ext_proxy.tag.clone());
-
-                    // chain
-                    let mut chain_outbound = internal::Outbound::new();
-                    chain_outbound.tag = ext_proxy.tag.clone();
-                    let mut chain_settings = internal::ChainOutboundSettings::new();
-                    if ext_proxy.amux.unwrap() {
-                        chain_settings.actors.push(amux_outbound.tag.clone());
-                    } else if ext_proxy.quic.unwrap() {
-                        chain_settings.actors.push(quic_outbound.tag.clone());
-                    } else {
-                        if ext_proxy.tls.unwrap() {
-                            chain_settings.actors.push(tls_outbound.tag.clone());
-                        }
-                        if ext_proxy.ws.unwrap() {
-                            chain_settings.actors.push(ws_outbound.tag.clone());
-                        }
-                    }
-
-                    if !chain_settings.actors.is_empty() {
-                        chain_settings.actors.push(outbound.tag.clone());
-                        let chain_settings = chain_settings.write_to_bytes().unwrap();
-                        chain_outbound.settings = chain_settings;
-                        chain_outbound.protocol = "chain".to_string();
-
-                        // always push chain first, in case there isn't final rule,
-                        // the chain outbound will be the default one to use
-                        outbounds.push(chain_outbound);
-                        if ext_proxy.amux.unwrap() {
-                            outbounds.push(amux_outbound);
-                        }
-                        if ext_proxy.quic.unwrap() {
-                            outbounds.push(quic_outbound);
-                        } else if ext_proxy.tls.unwrap() {
-                            outbounds.push(tls_outbound);
-                        }
-                        if ext_proxy.ws.unwrap() {
-                            outbounds.push(ws_outbound);
-                        }
-                        outbounds.push(outbound);
-                    } else {
-                        outbound.tag = ext_proxy.tag.clone();
-                        outbounds.push(outbound);
-                    }
+                    outbounds.push(common::Outbound {
+                        tag: Some(ext_proxy.tag.clone()),
+                        settings: common::OutboundSettings::Chain {
+                            settings: Some(common::ChainOutboundSettings {
+                                actors: Some(actors),
+                            }),
+                        },
+                    });
+                    outbounds.append(&mut component_outbounds);
                 }
                 _ => {}
             }
@@ -1257,239 +1431,545 @@ pub fn to_internal(conf: &mut Config) -> Result<internal::Config> {
 
     if let Some(ext_proxy_groups) = &conf.proxy_group {
         for ext_proxy_group in ext_proxy_groups {
-            let mut outbound = internal::Outbound::new();
-            outbound.protocol = ext_proxy_group.protocol.clone();
-            outbound.tag = ext_proxy_group.tag.clone();
-            match outbound.protocol.as_str() {
+            let protocol = ext_proxy_group.protocol.as_str();
+            match protocol {
                 "chain" => {
-                    let mut settings = internal::ChainOutboundSettings::new();
-                    if let Some(ext_actors) = &ext_proxy_group.actors {
-                        for ext_actor in ext_actors {
-                            settings.actors.push(ext_actor.to_string());
-                        }
-                    }
-                    let settings = settings.write_to_bytes().unwrap();
-                    outbound.settings = settings;
-                    outbounds.push(outbound);
+                    outbounds.push(common::Outbound {
+                        tag: Some(ext_proxy_group.tag.clone()),
+                        settings: common::OutboundSettings::Chain {
+                            settings: Some(common::ChainOutboundSettings {
+                                actors: ext_proxy_group.actors.clone(),
+                            }),
+                        },
+                    });
                 }
                 "tryall" => {
-                    let mut settings = internal::TryAllOutboundSettings::new();
-                    if let Some(ext_actors) = &ext_proxy_group.actors {
-                        for ext_actor in ext_actors {
-                            settings.actors.push(ext_actor.to_string());
-                        }
-                    }
-                    if let Some(ext_delay_base) = ext_proxy_group.delay_base {
-                        settings.delay_base = ext_delay_base;
-                    } else {
-                        settings.delay_base = 0;
-                    }
-                    let settings = settings.write_to_bytes().unwrap();
-                    outbound.settings = settings;
-                    outbounds.push(outbound);
+                    outbounds.push(common::Outbound {
+                        tag: Some(ext_proxy_group.tag.clone()),
+                        settings: common::OutboundSettings::TryAll {
+                            settings: Some(common::TryAllOutboundSettings {
+                                actors: ext_proxy_group.actors.clone(),
+                                delay_base: ext_proxy_group.delay_base,
+                            }),
+                        },
+                    });
                 }
                 "static" => {
-                    let mut settings = internal::StaticOutboundSettings::new();
-                    if let Some(ext_actors) = &ext_proxy_group.actors {
-                        for ext_actor in ext_actors {
-                            settings.actors.push(ext_actor.to_string());
-                        }
-                    }
-                    if let Some(ext_method) = &ext_proxy_group.method {
-                        settings.method = ext_method.clone();
-                    } else {
-                        settings.method = "random".to_string();
-                    }
-                    let settings = settings.write_to_bytes().unwrap();
-                    outbound.settings = settings;
-                    outbounds.push(outbound);
+                    outbounds.push(common::Outbound {
+                        tag: Some(ext_proxy_group.tag.clone()),
+                        settings: common::OutboundSettings::Static {
+                            settings: Some(common::StaticOutboundSettings {
+                                actors: ext_proxy_group.actors.clone(),
+                                method: ext_proxy_group.method.clone(),
+                            }),
+                        },
+                    });
                 }
                 "failover" => {
-                    let mut settings = internal::FailOverOutboundSettings::new();
-                    if let Some(ext_actors) = &ext_proxy_group.actors {
-                        settings.actors.extend_from_slice(ext_actors);
-                    }
-                    settings.fail_timeout = ext_proxy_group.fail_timeout.unwrap_or(4);
-                    settings.health_check = ext_proxy_group.health_check.unwrap_or(true);
-                    settings.check_interval = ext_proxy_group.check_interval.unwrap_or(5 * 60); // 5mins
-                    settings.failover = ext_proxy_group.failover.unwrap_or(true);
-                    settings.fallback_cache = ext_proxy_group.fallback_cache.unwrap_or(false);
-                    settings.cache_size = ext_proxy_group.cache_size.unwrap_or(256);
-                    settings.cache_timeout = ext_proxy_group.cache_timeout.unwrap_or(60); // 60mins
-                    settings.last_resort = ext_proxy_group.last_resort.as_ref().cloned();
-                    settings.health_check_timeout =
-                        ext_proxy_group.health_check_timeout.unwrap_or(6); // 6s
-                    settings.health_check_delay = ext_proxy_group.health_check_delay.unwrap_or(200); // 200ms
-                    settings.health_check_active =
-                        ext_proxy_group.health_check_active.unwrap_or(15 * 60); // 15mins
-                    if let Some(prefers) = &ext_proxy_group.health_check_prefers {
-                        settings.health_check_prefers.extend_from_slice(prefers);
-                    }
-                    settings.health_check_on_start =
-                        ext_proxy_group.health_check_on_start.unwrap_or(false);
-                    settings.health_check_wait = ext_proxy_group.health_check_wait.unwrap_or(false);
-                    settings.health_check_attempts =
-                        ext_proxy_group.health_check_attempts.unwrap_or(1);
-                    settings.health_check_success_percentage = ext_proxy_group
-                        .health_check_success_percentage
-                        .unwrap_or(50);
-                    let settings = settings.write_to_bytes().unwrap();
-                    outbound.settings = settings;
-                    outbounds.push(outbound);
+                    outbounds.push(common::Outbound {
+                        tag: Some(ext_proxy_group.tag.clone()),
+                        settings: common::OutboundSettings::FailOver {
+                            settings: Some(common::FailOverOutboundSettings {
+                                actors: ext_proxy_group.actors.clone(),
+                                fail_timeout: ext_proxy_group.fail_timeout,
+                                health_check: ext_proxy_group.health_check,
+                                health_check_timeout: ext_proxy_group.health_check_timeout,
+                                health_check_delay: ext_proxy_group.health_check_delay,
+                                health_check_active: ext_proxy_group.health_check_active,
+                                health_check_prefers: ext_proxy_group.health_check_prefers.clone(),
+                                check_interval: ext_proxy_group.check_interval,
+                                health_check_on_start: ext_proxy_group.health_check_on_start,
+                                health_check_wait: ext_proxy_group.health_check_wait,
+                                health_check_attempts: ext_proxy_group.health_check_attempts,
+                                health_check_success_percentage: ext_proxy_group
+                                    .health_check_success_percentage,
+                                failover: ext_proxy_group.failover,
+                                fallback_cache: ext_proxy_group.fallback_cache,
+                                cache_size: ext_proxy_group.cache_size,
+                                cache_timeout: ext_proxy_group.cache_timeout,
+                            }),
+                        },
+                    });
                 }
                 "select" => {
-                    let mut settings = internal::SelectOutboundSettings::new();
-                    if let Some(ext_actors) = &ext_proxy_group.actors {
-                        for ext_actor in ext_actors {
-                            settings.actors.push(ext_actor.to_string());
-                        }
-                    }
-                    let settings = settings.write_to_bytes().unwrap();
-                    outbound.settings = settings;
-                    outbounds.push(outbound);
+                    outbounds.push(common::Outbound {
+                        tag: Some(ext_proxy_group.tag.clone()),
+                        settings: common::OutboundSettings::Select {
+                            settings: Some(common::SelectOutboundSettings {
+                                actors: ext_proxy_group.actors.clone(),
+                            }),
+                        },
+                    });
+                }
+                "mptp" => {
+                    outbounds.push(common::Outbound {
+                        tag: Some(ext_proxy_group.tag.clone()),
+                        settings: common::OutboundSettings::Mptp {
+                            settings: Some(common::MptpOutboundSettings {
+                                actors: ext_proxy_group.actors.clone(),
+                                address: ext_proxy_group.address.clone(),
+                                port: ext_proxy_group.port,
+                            }),
+                        },
+                    });
                 }
                 _ => {}
             }
         }
     }
+    common_config.outbounds = Some(outbounds);
 
-    let mut int_router = internal::Router::new();
     let mut rules = Vec::new();
-    if let Some(ext_rules) = conf.rule.as_mut() {
-        for ext_rule in ext_rules.iter_mut() {
-            let mut rule = internal::router::Rule::new();
-
-            let target_tag = std::mem::take(&mut ext_rule.target);
-            rule.target_tag = target_tag;
-
-            // handle FINAL rule first
-            if ext_rule.type_field == "FINAL" {
-                // reorder outbounds to make the FINAL one first
-                let mut idx = None;
-                for (i, v) in outbounds.iter().enumerate() {
-                    if v.tag == rule.target_tag {
-                        idx = Some(i);
-                    }
-                }
-                if let Some(idx) = idx {
-                    let final_ob = outbounds.remove(idx);
-                    outbounds.insert(0, final_ob);
-                }
-                continue;
-            }
-
-            // the remaining rules must have a filter
-            let ext_filter = if let Some(f) = ext_rule.filter.as_mut() {
-                std::mem::take(f)
-            } else {
-                continue;
+    if let Some(ext_rules) = &conf.rule {
+        for ext_rule in ext_rules {
+            let mut rule = common::Rule {
+                type_field: Some(ext_rule.type_field.clone()),
+                ip: None,
+                domain: None,
+                domain_keyword: None,
+                domain_suffix: None,
+                geoip: None,
+                external: None,
+                port_range: None,
+                network: None,
+                inbound_tag: None,
+                process_name: None,
+                target: ext_rule.target.clone(),
             };
-            match ext_rule.type_field.as_str() {
-                "IP-CIDR" => {
-                    rule.ip_cidrs.push(ext_filter);
-                }
-                "DOMAIN" => {
-                    let mut domain = internal::router::rule::Domain::new();
-                    domain.type_ =
-                        protobuf::EnumOrUnknown::new(internal::router::rule::domain::Type::FULL);
-                    domain.value = ext_filter;
-                    rule.domains.push(domain);
-                }
-                "DOMAIN-KEYWORD" => {
-                    let mut domain = internal::router::rule::Domain::new();
-                    domain.type_ =
-                        protobuf::EnumOrUnknown::new(internal::router::rule::domain::Type::PLAIN);
-                    domain.value = ext_filter;
-                    rule.domains.push(domain);
-                }
-                "DOMAIN-SUFFIX" => {
-                    let mut domain = internal::router::rule::Domain::new();
-                    domain.type_ =
-                        protobuf::EnumOrUnknown::new(internal::router::rule::domain::Type::DOMAIN);
-                    domain.value = ext_filter;
-                    rule.domains.push(domain);
-                }
-                "GEOIP" => {
-                    let mut mmdb = internal::router::rule::Mmdb::new();
 
-                    let asset_loc = Path::new(&*crate::option::ASSET_LOCATION);
-                    mmdb.file = asset_loc.join("geo.mmdb").to_string_lossy().to_string();
-                    mmdb.country_code = ext_filter;
-                    rule.mmdbs.push(mmdb)
+            if let Some(filter) = &ext_rule.filter {
+                match ext_rule.type_field.as_str() {
+                    "IP-CIDR" => rule.ip = Some(vec![filter.clone()]),
+                    "DOMAIN" => rule.domain = Some(vec![filter.clone()]),
+                    "DOMAIN-KEYWORD" => rule.domain_keyword = Some(vec![filter.clone()]),
+                    "DOMAIN-SUFFIX" => rule.domain_suffix = Some(vec![filter.clone()]),
+                    "GEOIP" => rule.geoip = Some(vec![filter.clone()]),
+                    "EXTERNAL" => rule.external = Some(vec![filter.clone()]),
+                    "PORT-RANGE" => rule.port_range = Some(vec![filter.clone()]),
+                    "NETWORK" => rule.network = Some(vec![filter.clone()]),
+                    "INBOUND-TAG" => rule.inbound_tag = Some(vec![filter.clone()]),
+                    "PROCESS-NAME" => rule.process_name = Some(vec![filter.clone()]),
+                    _ => {}
                 }
-                "EXTERNAL" => match external_rule::add_external_rule(&mut rule, &ext_filter) {
-                    Ok(_) => (),
-                    Err(e) => {
-                        println!("load external rule failed: {}", e);
-                    }
-                },
-                "PORT-RANGE" => {
-                    rule.port_ranges.push(ext_filter);
-                }
-                "NETWORK" => {
-                    rule.networks.push(ext_filter);
-                }
-                "INBOUND-TAG" => {
-                    rule.inbound_tags.push(ext_filter);
-                }
-                _ => {}
             }
             rules.push(rule);
         }
     }
-    int_router.rules = rules;
+    common_config.router = Some(common::Router {
+        rules: Some(rules),
+        domain_resolve: conf.general.as_ref().and_then(|g| g.routing_domain_resolve),
+    });
+
+    let mut dns = common::Dns {
+        servers: None,
+        hosts: None,
+    };
     if let Some(ext_general) = &conf.general {
-        if let Some(ext_domain_resolve) = ext_general.routing_domain_resolve {
-            int_router.domain_resolve = ext_domain_resolve;
-        }
+        dns.servers = ext_general.dns_server.clone();
     }
-    let router = protobuf::MessageField::some(int_router);
+    dns.hosts = conf.host.clone();
+    common_config.dns = Some(dns);
 
-    let mut dns = internal::Dns::new();
-    let mut servers = Vec::new();
-    let mut hosts = HashMap::new();
-    if let Some(ext_general) = &conf.general {
-        if let Some(ext_dns_servers) = &ext_general.dns_server {
-            for ext_dns_server in ext_dns_servers {
-                servers.push(ext_dns_server.clone());
-            }
-            if !servers.is_empty() {
-                dns.servers = servers;
-            }
-        }
-    }
-    if dns.servers.is_empty() {
-        dns.servers.push("1.1.1.1".to_string());
-    }
-    if let Some(ext_hosts) = &conf.host {
-        for (name, static_ips) in ext_hosts.iter() {
-            let mut ips = internal::dns::Ips::new();
-            let mut ip_vals = Vec::new();
-            for ip in static_ips {
-                ip_vals.push(ip.to_owned());
-            }
-            ips.values = ip_vals;
-            hosts.insert(name.to_owned(), ips);
-        }
-    }
-    if !hosts.is_empty() {
-        dns.hosts = hosts;
-    }
+    Ok(common_config)
+}
 
-    let mut config = internal::Config::new();
-    config.log = protobuf::MessageField::some(log);
-    config.inbounds = inbounds;
-    config.outbounds = outbounds;
-    config.router = router;
-    config.dns = protobuf::MessageField::some(dns);
-
-    Ok(config)
+pub fn to_internal(conf: &Config) -> Result<internal::Config> {
+    let common_config = to_common(conf)?;
+    common::to_internal(common_config)
 }
 
 pub fn from_string(s: &str) -> Result<internal::Config> {
     let lines = s.lines().map(|s| Ok(s.to_string())).collect();
-    let mut config = from_lines(lines)?;
-    to_internal(&mut config)
+    let config = from_lines(lines)?;
+    to_internal(&config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use protobuf::Message;
+
+    #[test]
+    fn test_trojan_tls_outbound_order() {
+        let conf = r#"
+[Proxy]
+Direct = direct
+Trojan = trojan, 1.2.3.4, 443, password, sni=www.google.com
+"#;
+        let lines: Vec<io::Result<String>> = conf.lines().map(|s| Ok(s.to_string())).collect();
+        let config = from_lines(lines).unwrap();
+        let common = to_common(&config).unwrap();
+
+        let outbounds = common.outbounds.unwrap();
+        // The first outbound should be "Direct"
+        assert_eq!(outbounds[0].tag, Some("Direct".to_string()));
+        // The second outbound should be the main "Trojan" outbound (which is a Chain)
+        assert_eq!(outbounds[1].tag, Some("Trojan".to_string()));
+        if let common::OutboundSettings::Chain { .. } = &outbounds[1].settings {
+            // Correct
+        } else {
+            panic!(
+                "Second outbound is not a Chain: {:?}",
+                outbounds[1].settings
+            );
+        }
+        // The third outbound should be the TLS component
+        assert_eq!(outbounds[2].tag, Some("Trojan_tls_xxx".to_string()));
+    }
+
+    #[test]
+    fn test_vmess_amux_outbound_order() {
+        let conf = r#"
+[Proxy]
+Vmess = vmess, 1.2.3.4, 443, username, amux=true, sni=www.google.com
+"#;
+        let lines: Vec<io::Result<String>> = conf.lines().map(|s| Ok(s.to_string())).collect();
+        let config = from_lines(lines).unwrap();
+        let common = to_common(&config).unwrap();
+
+        let outbounds = common.outbounds.unwrap();
+        // The first outbound should be the main "Vmess" outbound (Chain)
+        assert_eq!(outbounds[0].tag, Some("Vmess".to_string()));
+        // The following should be components
+        let tags: Vec<_> = outbounds.iter().map(|o| o.tag.as_ref().unwrap()).collect();
+        assert!(tags.contains(&&"Vmess_tls_xxx".to_string()));
+        assert!(tags.contains(&&"Vmess_amux_xxx".to_string()));
+        assert!(tags.contains(&&"Vmess_vmess_xxx".to_string()));
+        let vmess = outbounds
+            .iter()
+            .find(|o| o.tag == Some("Vmess_vmess_xxx".to_string()))
+            .unwrap();
+        if let common::OutboundSettings::VMess { settings } = &vmess.settings {
+            assert_eq!(
+                settings.as_ref().unwrap().uuid,
+                Some("username".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn test_trojan_tls_ech_mapping() {
+        let conf = r#"
+[Proxy]
+Trojan = trojan, 1.2.3.4, 443, password, sni=www.google.com, tls-ech=true, tls-ech-config-list=AQID
+"#;
+        let lines: Vec<io::Result<String>> = conf.lines().map(|s| Ok(s.to_string())).collect();
+        let config = from_lines(lines).unwrap();
+        let common = to_common(&config).unwrap();
+
+        let outbounds = common.outbounds.unwrap();
+        let tls_outbound = outbounds
+            .iter()
+            .find(|o| o.tag == Some("Trojan_tls_xxx".to_string()))
+            .unwrap();
+        if let common::OutboundSettings::Tls { settings } = &tls_outbound.settings {
+            assert_eq!(
+                settings.as_ref().unwrap().ech_config_list,
+                Some("AQID".to_string())
+            );
+        } else {
+            panic!("Not tls outbound: {:?}", tls_outbound.settings);
+        }
+
+        let internal = to_internal(&config).unwrap();
+        let tls_outbound = internal
+            .outbounds
+            .iter()
+            .find(|o| o.tag == "Trojan_tls_xxx")
+            .unwrap();
+        let tls_settings =
+            crate::config::internal::TlsOutboundSettings::parse_from_bytes(&tls_outbound.settings)
+                .unwrap();
+        assert_eq!(tls_settings.ech_config_list, "AQID".to_string());
+    }
+
+    #[test]
+    fn test_trojan_tls_ech_mapping_from_section() {
+        let conf = r#"
+[Proxy]
+Trojan = trojan, 1.2.3.4, 443, password, sni=www.google.com, tls-ech=true, tls-ech-config-list=myech
+
+[Ech.myech]
+AQI=
+"#;
+        let lines: Vec<io::Result<String>> = conf.lines().map(|s| Ok(s.to_string())).collect();
+        let config = from_lines(lines).unwrap();
+        let common = to_common(&config).unwrap();
+
+        let outbounds = common.outbounds.unwrap();
+        let tls_outbound = outbounds
+            .iter()
+            .find(|o| o.tag == Some("Trojan_tls_xxx".to_string()))
+            .unwrap();
+        if let common::OutboundSettings::Tls { settings } = &tls_outbound.settings {
+            assert_eq!(
+                settings
+                    .as_ref()
+                    .unwrap()
+                    .ech_config_list
+                    .as_deref()
+                    .map(str::trim),
+                Some("AQI=")
+            );
+        } else {
+            panic!("Not tls outbound: {:?}", tls_outbound.settings);
+        }
+
+        let internal = to_internal(&config).unwrap();
+        let tls_outbound = internal
+            .outbounds
+            .iter()
+            .find(|o| o.tag == "Trojan_tls_xxx")
+            .unwrap();
+        let tls_settings =
+            crate::config::internal::TlsOutboundSettings::parse_from_bytes(&tls_outbound.settings)
+                .unwrap();
+        assert_eq!(tls_settings.ech_config_list.trim(), "AQI=");
+    }
+
+    #[test]
+    fn test_trojan_tls_ech_validation() {
+        let mut proxy = Proxy::default();
+        proxy.tag = "Trojan".to_string();
+        proxy.protocol = "trojan".to_string();
+        proxy.address = Some("1.2.3.4".to_string());
+        proxy.port = Some(443);
+        proxy.password = Some("password".to_string());
+        proxy.sni = Some("www.google.com".to_string());
+        proxy.tls_ech = Some(true);
+        proxy.tls_ech_config_list = Some("   ".to_string());
+
+        let config = Config {
+            general: None,
+            proxy: Some(vec![proxy]),
+            proxy_group: None,
+            rule: None,
+            host: None,
+            certificates: None,
+            ech_configs: None,
+        };
+
+        let err = to_internal(&config).unwrap_err();
+        assert!(err.to_string().contains("echConfigList cannot be empty"));
+    }
+
+    #[test]
+    fn test_wintun_conf() {
+        let conf = r#"
+[General]
+tun = auto
+wintun = /path/to/wintun.dll
+tun-dns-server = 8.8.8.8, 8.8.4.4
+"#;
+        let lines: Vec<io::Result<String>> = conf.lines().map(|s| Ok(s.to_string())).collect();
+        let config = from_lines(lines).unwrap();
+        let common = to_common(&config).unwrap();
+
+        if let Some(inbounds) = common.inbounds {
+            let tun = inbounds
+                .iter()
+                .find(|i| i.tag == Some("tun".to_string()))
+                .unwrap();
+            if let common::InboundSettings::Tun { settings } = &tun.settings {
+                let settings = settings.as_ref().unwrap();
+                assert_eq!(settings.wintun, Some("/path/to/wintun.dll".to_string()));
+                assert_eq!(
+                    settings.dns_servers,
+                    Some(vec!["8.8.8.8".to_string(), "8.8.4.4".to_string()])
+                );
+            } else {
+                panic!("Not tun inbound");
+            }
+        } else {
+            panic!("No inbounds");
+        }
+    }
+
+    #[test]
+    fn test_tls_ech_fallback_mapping() {
+        let conf = r#"
+[General]
+dns-server = 1.1.1.1
+
+[Proxy]
+Trojan = trojan, 1.2.3.4, 443, password, sni=www.google.com, tls-ech=true, tls-ech-disable-dns-lookup=true, tls-ech-config-list=AQID
+"#;
+        let lines: Vec<io::Result<String>> = conf.lines().map(|s| Ok(s.to_string())).collect();
+        let config = from_lines(lines).unwrap();
+        let internal = to_internal(&config).unwrap();
+
+        let tls_outbound = internal
+            .outbounds
+            .iter()
+            .find(|o| o.tag == "Trojan_tls_xxx")
+            .unwrap();
+        let tls_settings =
+            crate::config::internal::TlsOutboundSettings::parse_from_bytes(&tls_outbound.settings)
+                .unwrap();
+        assert!(tls_settings.ech);
+        assert!(tls_settings.ech_disable_dns_lookup);
+        assert_eq!(tls_settings.ech_config_list, "AQID");
+    }
+
+    #[test]
+    fn test_vmess_vless_uuid() {
+        let conf = r#"
+[Proxy]
+Vmess1 = vmess, 1.2.3.4, 443, username, uuid=uuid1
+Vmess2 = vmess, 1.2.3.4, 443, username
+Vless1 = vless, 1.2.3.4, 443, password, uuid=uuid2
+Vless2 = vless, 1.2.3.4, 443, password
+"#;
+        let lines: Vec<io::Result<String>> = conf.lines().map(|s| Ok(s.to_string())).collect();
+        let config = from_lines(lines).unwrap();
+        let common = to_common(&config).unwrap();
+
+        let outbounds = common.outbounds.unwrap();
+
+        // Vmess1: should use uuid1
+        let vmess1 = outbounds
+            .iter()
+            .find(|o| o.tag == Some("Vmess1_vmess_xxx".to_string()))
+            .unwrap();
+        if let common::OutboundSettings::VMess { settings } = &vmess1.settings {
+            assert_eq!(settings.as_ref().unwrap().uuid, Some("uuid1".to_string()));
+        } else {
+            panic!("Not vmess: {:?}", vmess1.settings);
+        }
+
+        // Vmess2: should use username
+        let vmess2 = outbounds
+            .iter()
+            .find(|o| o.tag == Some("Vmess2_vmess_xxx".to_string()))
+            .unwrap();
+        if let common::OutboundSettings::VMess { settings } = &vmess2.settings {
+            assert_eq!(
+                settings.as_ref().unwrap().uuid,
+                Some("username".to_string())
+            );
+        } else {
+            panic!("Not vmess: {:?}", vmess2.settings);
+        }
+
+        // Vless1: should use uuid2
+        let vless1 = outbounds
+            .iter()
+            .find(|o| o.tag == Some("Vless1".to_string()))
+            .unwrap();
+        if let common::OutboundSettings::Vless { settings } = &vless1.settings {
+            assert_eq!(settings.as_ref().unwrap().uuid, Some("uuid2".to_string()));
+        } else {
+            panic!("Not vless: {:?}", vless1.settings);
+        }
+
+        // Vless2: should use password
+        let vless2 = outbounds
+            .iter()
+            .find(|o| o.tag == Some("Vless2".to_string()))
+            .unwrap();
+        if let common::OutboundSettings::Vless { settings } = &vless2.settings {
+            assert_eq!(
+                settings.as_ref().unwrap().uuid,
+                Some("password".to_string())
+            );
+        } else {
+            panic!("Not vless: {:?}", vless2.settings);
+        }
+    }
+
+    #[test]
+    fn test_mptp_proxy_group() {
+        let conf = r#"
+[Proxy Group]
+MptpOutTag = mptp, actor1, actor2, actor3, address=1.2.3.4, port=10000
+"#;
+        let lines: Vec<io::Result<String>> = conf.lines().map(|s| Ok(s.to_string())).collect();
+        let config = from_lines(lines).unwrap();
+        let common = to_common(&config).unwrap();
+
+        let outbounds = common.outbounds.unwrap();
+        assert_eq!(outbounds.len(), 1);
+        let mptp = &outbounds[0];
+        assert_eq!(mptp.tag, Some("MptpOutTag".to_string()));
+        if let common::OutboundSettings::Mptp { settings } = &mptp.settings {
+            let settings = settings.as_ref().unwrap();
+            assert_eq!(
+                settings.actors,
+                Some(vec![
+                    "actor1".to_string(),
+                    "actor2".to_string(),
+                    "actor3".to_string()
+                ])
+            );
+            assert_eq!(settings.address, Some("1.2.3.4".to_string()));
+            assert_eq!(settings.port, Some(10000));
+        } else {
+            panic!("Not mptp outbound: {:?}", mptp.settings);
+        }
+    }
+
+    #[test]
+    fn test_section_name_compatibility() {
+        let conf = r#"
+[general]
+loglevel = trace
+
+[PROXY_GROUP]
+ProxyGroup1 = select, Direct, Trojan
+
+[proxygroup]
+ProxyGroup2 = select, Direct, Trojan
+
+[proxy_group]
+ProxyGroup3 = select, Direct, Trojan
+
+[rule]
+DOMAIN,google.com,Direct
+
+[host]
+google.com = 1.2.3.4
+
+[certificate_MyCert]
+CERT1
+
+[certificate.AnotherCert]
+CERT2
+
+[certificate MyThirdCert]
+CERT3
+
+[certificateNoSpaceCert]
+CERT4
+"#;
+        let lines: Vec<io::Result<String>> = conf.lines().map(|s| Ok(s.to_string())).collect();
+        let config = from_lines(lines).unwrap();
+
+        assert!(config.general.is_some());
+        assert_eq!(config.general.unwrap().loglevel, Some("trace".to_string()));
+
+        assert!(config.proxy_group.is_some());
+        assert_eq!(config.proxy_group.as_ref().unwrap().len(), 3);
+        assert_eq!(config.proxy_group.as_ref().unwrap()[0].tag, "ProxyGroup1");
+        assert_eq!(config.proxy_group.as_ref().unwrap()[1].tag, "ProxyGroup2");
+        assert_eq!(config.proxy_group.as_ref().unwrap()[2].tag, "ProxyGroup3");
+
+        assert!(config.rule.is_some());
+        assert_eq!(config.rule.unwrap().len(), 1);
+
+        assert!(config.host.is_some());
+        assert_eq!(config.host.unwrap().len(), 1);
+
+        assert!(config.certificates.is_some());
+        let certs = config.certificates.unwrap();
+        assert!(certs.contains_key("MyCert"));
+        assert!(certs.contains_key("AnotherCert"));
+        assert!(certs.contains_key("MyThirdCert"));
+        assert!(certs.contains_key("NoSpaceCert"));
+        assert_eq!(certs.get("MyCert").unwrap(), "CERT1\n");
+        assert_eq!(certs.get("AnotherCert").unwrap(), "CERT2\n");
+        assert_eq!(certs.get("MyThirdCert").unwrap(), "CERT3\n");
+        assert_eq!(certs.get("NoSpaceCert").unwrap(), "CERT4\n");
+    }
 }
 
 pub fn from_file<P>(path: P) -> Result<internal::Config>
@@ -1497,6 +1977,6 @@ where
     P: AsRef<Path>,
 {
     let lines = read_lines(path)?.collect();
-    let mut config = from_lines(lines)?;
-    to_internal(&mut config)
+    let config = from_lines(lines)?;
+    to_internal(&config)
 }
